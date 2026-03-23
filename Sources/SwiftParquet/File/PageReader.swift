@@ -21,6 +21,9 @@ struct DecodedDictionaryPage {
     let data: Data
 }
 
+/// Closure that decrypts page data. Parameters: (encryptedData, pageOrdinal) → plaintext.
+typealias PageDecryptor = (Data, Int16) throws -> Data
+
 // MARK: - Page Reader
 
 struct PageReader {
@@ -42,7 +45,9 @@ struct PageReader {
         headerSize: Int,
         codec: CompressionCodec,
         maxDefLevel: Int16,
-        maxRepLevel: Int16
+        maxRepLevel: Int16,
+        decryptor: PageDecryptor? = nil,
+        pageOrdinal: Int16 = 0
     ) throws -> DecodedDataPage {
         guard let dpHeader = header.dataPageHeader else {
             throw ParquetError.invalidPageHeader("missing data page header")
@@ -52,6 +57,11 @@ struct PageReader {
         let bodyEnd = bodyStart + Int(header.compressedPageSize)
         guard bodyEnd <= data.endIndex else { throw ParquetError.unexpectedEOF }
         var pageBody = Data(data[bodyStart..<bodyEnd])
+
+        // Decrypt before decompression (Parquet spec: encrypt after compress)
+        if let decrypt = decryptor {
+            pageBody = try decrypt(pageBody, pageOrdinal)
+        }
 
         // Decompress if needed
         if codec != .uncompressed {
@@ -103,7 +113,9 @@ struct PageReader {
         headerSize: Int,
         codec: CompressionCodec,
         maxDefLevel: Int16,
-        maxRepLevel: Int16
+        maxRepLevel: Int16,
+        decryptor: PageDecryptor? = nil,
+        pageOrdinal: Int16 = 0
     ) throws -> DecodedDataPage {
         guard let v2Header = header.dataPageHeaderV2 else {
             throw ParquetError.invalidPageHeader("missing data page header V2")
@@ -158,7 +170,8 @@ struct PageReader {
         at offset: Int,
         header: PageHeader,
         headerSize: Int,
-        codec: CompressionCodec
+        codec: CompressionCodec,
+        decryptor: PageDecryptor? = nil
     ) throws -> DecodedDictionaryPage {
         guard let dictHeader = header.dictionaryPageHeader else {
             throw ParquetError.invalidPageHeader("missing dictionary page header")
@@ -168,6 +181,10 @@ struct PageReader {
         let bodyEnd = bodyStart + Int(header.compressedPageSize)
         guard bodyEnd <= data.endIndex else { throw ParquetError.unexpectedEOF }
         var pageBody = Data(data[bodyStart..<bodyEnd])
+
+        if let decrypt = decryptor {
+            pageBody = try decrypt(pageBody, -1)
+        }
 
         if codec != .uncompressed {
             let decompressor = try CompressionCodecs.codec(for: codec)

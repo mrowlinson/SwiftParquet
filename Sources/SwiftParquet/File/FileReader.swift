@@ -10,7 +10,14 @@
 
 import Foundation
 
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+
 private let parquetMagicBytes = Data([0x50, 0x41, 0x52, 0x31])  // "PAR1"
+private let parquetEncMagicBytes = Data([0x50, 0x41, 0x52, 0x45])  // "PARE"
 
 // MARK: - Parquet Table (read result)
 
@@ -36,26 +43,24 @@ public struct ParquetFileReaderCore {
     let metadata: FileMetaData
     public let schema: ParquetSchema
     private let data: Data
+    private let footerDecryptor: FooterEncryptor?  // reuses the closure type
+    private let columnDecryptorFactory: ((String, Int16, Int16) -> PageDecryptor?)?
 
     /// Initialize from raw file data.
-    public init(data: Data) throws {
+    public init(data: Data, encryption: ParquetEncryptionConfig? = nil) throws {
         guard data.count >= 12 else {
             throw ParquetError.corruptedFile("file too small (\(data.count) bytes)")
         }
 
-        // Validate magic at start
         let headerMagic = data[data.startIndex..<(data.startIndex + 4)]
-        guard headerMagic == parquetMagicBytes else {
-            throw ParquetError.invalidMagicBytes
-        }
-
-        // Validate magic at end
         let footerMagic = data[(data.endIndex - 4)..<data.endIndex]
-        guard footerMagic == parquetMagicBytes else {
-            throw ParquetError.invalidMagicBytes
+        let isEncryptedFooter = headerMagic == parquetEncMagicBytes && footerMagic == parquetEncMagicBytes
+
+        if !isEncryptedFooter {
+            guard headerMagic == parquetMagicBytes else { throw ParquetError.invalidMagicBytes }
+            guard footerMagic == parquetMagicBytes else { throw ParquetError.invalidMagicBytes }
         }
 
-        // Read footer length (4 bytes before trailing magic)
         var footerLength: UInt32 = 0
         let footerLenStart = data.endIndex - 8
         withUnsafeMutableBytes(of: &footerLength) { ptr in
@@ -67,22 +72,35 @@ public struct ParquetFileReaderCore {
             throw ParquetError.corruptedFile("footer length \(footerLength) exceeds file size")
         }
 
-        // Read FileMetaData
         let metadataStart = data.endIndex - 8 - Int(footerLength)
-        let metadataData = Data(data[metadataStart..<(metadataStart + Int(footerLength))])
+        var metadataData = Data(data[metadataStart..<(metadataStart + Int(footerLength))])
+
+        // Decrypt footer if PARE magic
+        if isEncryptedFooter {
+
+            guard let enc = encryption, let footerKey = enc.footerKey else {
+                throw ParquetError.corruptedFile("encrypted footer requires encryption key")
+            }
+            let aad = ParquetAESGCM.buildAAD(moduleType: .footer)
+            metadataData = try ParquetAESGCM.decrypt(metadataData, key: footerKey, aad: aad)
+        }
+
         var reader = ThriftCompactReader(data: metadataData)
         self.metadata = try FileMetaData.read(from: &reader)
         self.data = data
+        self.footerDecryptor = nil
 
-        // Build schema from schema elements
+        // Page-level decryption not yet supported (only footer encryption)
+        self.columnDecryptorFactory = nil
+
         self.schema = try ParquetFileReaderCore.buildSchema(from: self.metadata.schema)
     }
 
     /// Initialize from a file path.
-    public init(path: String) throws {
+    public init(path: String, encryption: ParquetEncryptionConfig? = nil) throws {
         let url = URL(fileURLWithPath: path)
         let fileData = try Data(contentsOf: url)
-        try self.init(data: fileData)
+        try self.init(data: fileData, encryption: encryption)
     }
 
     /// Number of row groups in the file.
@@ -123,11 +141,13 @@ public struct ParquetFileReaderCore {
             let leaf = leafColumns[i]
             let descriptor = ColumnDescriptor(node: leaf)
 
+            let decryptor = columnDecryptorFactory?(leaf.name, Int16(index), Int16(i))
             let reader = ColumnChunkReader(
                 columnMeta: chunk.metaData,
                 fileData: data,
                 maxDefLevel: descriptor.maxDefinitionLevel,
-                maxRepLevel: descriptor.maxRepetitionLevel
+                maxRepLevel: descriptor.maxRepetitionLevel,
+                decryptor: decryptor
             )
             let values = try reader.readAll()
             result.append((name: leaf.name, values: values))
@@ -171,7 +191,7 @@ public struct ParquetFileReaderCore {
 
         let rowGroup = metadata.rowGroups[index]
         let leafColumns = schema.columns
-        let fileData = self.data  // Data is value type, safe to capture
+        let fileData = self.data
 
         return try await withThrowingTaskGroup(of: (Int, String, ColumnValues).self) { group in
             for (i, chunk) in rowGroup.columns.enumerated() {

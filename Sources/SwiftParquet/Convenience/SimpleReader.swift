@@ -18,14 +18,14 @@ import Foundation
 public struct ParquetFileReader {
 
     /// Read a Parquet file and return all data as a ParquetTable.
-    public static func read(path: String) throws -> ParquetTable {
-        let reader = try ParquetFileReaderCore(path: path)
+    public static func read(path: String, encryption: ParquetEncryptionConfig? = nil) throws -> ParquetTable {
+        let reader = try ParquetFileReaderCore(path: path, encryption: encryption)
         return try reader.readAll()
     }
 
     /// Read a Parquet file from Data.
-    public static func read(data: Data) throws -> ParquetTable {
-        let reader = try ParquetFileReaderCore(data: data)
+    public static func read(data: Data, encryption: ParquetEncryptionConfig? = nil) throws -> ParquetTable {
+        let reader = try ParquetFileReaderCore(data: data, encryption: encryption)
         return try reader.readAll()
     }
 
@@ -35,8 +35,8 @@ public struct ParquetFileReader {
     }
 
     /// Read specific row groups.
-    public static func read(path: String, rowGroups: [Int]) throws -> ParquetTable {
-        let reader = try ParquetFileReaderCore(path: path)
+    public static func read(path: String, rowGroups: [Int], encryption: ParquetEncryptionConfig? = nil) throws -> ParquetTable {
+        let reader = try ParquetFileReaderCore(path: path, encryption: encryption)
         var allColumns: [(name: String, values: ColumnValues)]? = nil
         var totalRows = 0
 
@@ -62,14 +62,14 @@ public struct ParquetFileReader {
     }
 
     /// Read a Parquet file with parallel column decoding.
-    public static func readAsync(path: String) async throws -> ParquetTable {
-        let reader = try ParquetFileReaderCore(path: path)
+    public static func readAsync(path: String, encryption: ParquetEncryptionConfig? = nil) async throws -> ParquetTable {
+        let reader = try ParquetFileReaderCore(path: path, encryption: encryption)
         return try await reader.readAllAsync()
     }
 
     /// Read from Data with parallel column decoding.
-    public static func readAsync(data: Data) async throws -> ParquetTable {
-        let reader = try ParquetFileReaderCore(data: data)
+    public static func readAsync(data: Data, encryption: ParquetEncryptionConfig? = nil) async throws -> ParquetTable {
+        let reader = try ParquetFileReaderCore(data: data, encryption: encryption)
         return try await reader.readAllAsync()
     }
 

@@ -281,3 +281,66 @@ import Foundation
     let decoded = try DeltaBinaryPackedDecoder.decode(encoded)
     #expect(decoded == values)
 }
+
+// MARK: - Zstd Compression
+
+@Test func zstdCompressDecompress() throws {
+    let original = Data("Zstd test data with some content to compress. Repeated text repeated text repeated.".utf8)
+    let codec = ZstdCodec()
+    let compressed = try codec.compress(original)
+    let decompressed = try codec.decompress(compressed, uncompressedSize: original.count)
+    #expect(decompressed == original)
+}
+
+@Test func writeAndReadZstd() throws {
+    let path = NSTemporaryDirectory() + "zstd-\(UUID().uuidString).parquet"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    var builder = SchemaBuilder()
+    builder.addColumn(name: "name", type: .byteArray)
+    builder.addColumn(name: "value", type: .int64)
+    let schema = builder.build()
+
+    var writer = ParquetFileWriter(path: path, schema: schema, options: .zstd)
+    try writer.writeRowGroup(columns: [
+        ("name", .strings(["alpha", "beta", "gamma", "delta"])),
+        ("value", .int64s([100, 200, 300, 400])),
+    ])
+    try writer.close()
+
+    let table = try ParquetFileReader.read(path: path)
+    #expect(table.numRows == 4)
+    if case .strings(let v) = table.column("name") { #expect(v == ["alpha", "beta", "gamma", "delta"]) }
+    if case .int64s(let v) = table.column("value") { #expect(v == [100, 200, 300, 400]) }
+    validateWithPyarrow(path: path, expectedRows: 4, expectedColumns: ["name", "value"])
+}
+
+@Test func readPyarrowZstd() throws {
+    guard let python = findPython3() else { return }
+    let path = NSTemporaryDirectory() + "pyarrow-zstd-\(UUID().uuidString).parquet"
+    defer { try? FileManager.default.removeItem(atPath: path) }
+
+    let proc = Process()
+    proc.executableURL = URL(fileURLWithPath: python)
+    proc.arguments = ["-c", """
+    import pyarrow as pa, pyarrow.parquet as pq
+    t = pa.table({'x': [10, 20, 30, 40, 50], 'y': ['a', 'b', 'c', 'd', 'e']})
+    pq.write_table(t, '\(path)', compression='zstd')
+    print('OK')
+    """]
+    let pipe = Pipe()
+    proc.standardOutput = pipe
+    proc.standardError = Pipe()
+    try proc.run()
+    proc.waitUntilExit()
+
+    let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    guard output.trimmingCharacters(in: .whitespacesAndNewlines) == "OK" else {
+        Issue.record("pyarrow zstd write failed: \(output)"); return
+    }
+
+    let table = try ParquetFileReader.read(path: path)
+    #expect(table.numRows == 5)
+    if case .int64s(let v) = table.column("x") { #expect(v == [10, 20, 30, 40, 50]) }
+    if case .strings(let v) = table.column("y") { #expect(v == ["a", "b", "c", "d", "e"]) }
+}

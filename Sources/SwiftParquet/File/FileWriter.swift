@@ -11,6 +11,10 @@
 import Foundation
 
 private let parquetMagic = Data([0x50, 0x41, 0x52, 0x31])  // "PAR1"
+private let parquetEncryptedMagic = Data([0x50, 0x41, 0x52, 0x45])  // "PARE"
+
+/// Closure that encrypts footer bytes. Captures the footer key.
+typealias FooterEncryptor = (Data) throws -> Data
 
 // MARK: - FileWriter
 
@@ -18,6 +22,7 @@ struct FileWriter {
     private let schema: ParquetSchema
     private var rowGroupResults: [RowGroupWriteResult] = []
     private var fileBody = Data()
+    var footerEncryptor: FooterEncryptor? = nil
 
     init(schema: ParquetSchema) {
         self.schema = schema
@@ -31,7 +36,7 @@ struct FileWriter {
         rowGroupResults.append(result)
     }
 
-    mutating func finalize() -> Data {
+    mutating func finalize() throws -> Data {
         let rowGroups = rowGroupResults.map { $0.rowGroup }
         let schemaElements = schema.toSchemaElements()
 
@@ -40,22 +45,31 @@ struct FileWriter {
             schema: schemaElements,
             numRows: rowGroups.reduce(0) { $0 + $1.numRows },
             rowGroups: rowGroups,
-            createdBy: "SwiftParquet 0.2"
+            createdBy: "SwiftParquet 0.4"
         )
 
         let footerBytes = ThriftCompactWriter.serialize(fileMeta)
         var file = fileBody
-        file.append(contentsOf: footerBytes)
 
-        let footerLength = UInt32(footerBytes.count)
-        withUnsafeBytes(of: footerLength.littleEndian) { file.append(contentsOf: $0) }
-        file.append(contentsOf: parquetMagic)
+        if let encrypt = footerEncryptor {
+            let encrypted = try encrypt(footerBytes)
+            file.replaceSubrange(file.startIndex..<(file.startIndex + 4), with: parquetEncryptedMagic)
+            file.append(contentsOf: encrypted)
+            let footerLength = UInt32(encrypted.count)
+            withUnsafeBytes(of: footerLength.littleEndian) { file.append(contentsOf: $0) }
+            file.append(contentsOf: parquetEncryptedMagic)
+        } else {
+            file.append(contentsOf: footerBytes)
+            let footerLength = UInt32(footerBytes.count)
+            withUnsafeBytes(of: footerLength.littleEndian) { file.append(contentsOf: $0) }
+            file.append(contentsOf: parquetMagic)
+        }
 
         return file
     }
 
     mutating func write(to url: URL) throws {
-        let data = finalize()
+        let data = try finalize()
         try data.write(to: url)
     }
 

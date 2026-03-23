@@ -3,6 +3,12 @@
 
 import Foundation
 
+#if canImport(CryptoKit)
+import CryptoKit
+#else
+import Crypto
+#endif
+
 // MARK: - Column Value Box
 
 /// Type-erased column values. Used by ParquetFileWriter.writeRowGroup.
@@ -145,12 +151,26 @@ public struct ParquetFileWriter {
     private let schema: ParquetSchema
     private let writeOptions: ParquetWriteOptions
     private var fileWriter: FileWriter
+    private let encryption: ParquetEncryptionConfig?
+    private var rowGroupOrdinal: Int16 = 0
 
-    public init(path: String, schema: ParquetSchema, options: ParquetWriteOptions = ParquetWriteOptions()) {
+    public init(path: String, schema: ParquetSchema, options: ParquetWriteOptions = ParquetWriteOptions(),
+                encryption: ParquetEncryptionConfig? = nil) {
         self.path = path
         self.schema = schema
         self.writeOptions = options
+        self.encryption = encryption
         self.fileWriter = FileWriter(schema: schema)
+
+        if let enc = encryption, let footerKey = enc.footerKey, !enc.plaintextFooter {
+            // Capture key data to avoid SymmetricKey lifecycle issues across struct copies
+            let keyData = footerKey.withUnsafeBytes { Data($0) }
+            self.fileWriter.footerEncryptor = { footerBytes in
+                let key = SymmetricKey(data: keyData)
+                let aad = ParquetAESGCM.buildAAD(moduleType: .footer)
+                return try ParquetAESGCM.encrypt(footerBytes, key: key, aad: aad)
+            }
+        }
     }
 
     public mutating func writeRowGroup(columns: [(String, ColumnValues)]) throws {
@@ -168,15 +188,10 @@ public struct ParquetFileWriter {
 
         let schemaCols = schema.columns
         var colWriters: [AnyColumnWriter] = []
-
-        let colOpts = ColumnWriteOptions(
-            compression: writeOptions.compression,
-            useDictionary: writeOptions.useDictionary,
-            enableStatistics: writeOptions.enableStatistics,
-            dataPageVersion: writeOptions.dataPageVersion
-        )
+        let rgOrd = rowGroupOrdinal
 
         for (i, (_, values)) in columns.enumerated() {
+            let colOpts = makeColumnWriteOptions(columnOrdinal: Int16(i), rowGroupOrdinal: rgOrd, columnPath: schemaCols[i].name)
             let desc = ColumnDescriptor(node: schemaCols[i])
             switch values {
             case .strings(let vs):
@@ -214,6 +229,7 @@ public struct ParquetFileWriter {
             schema: schema, numRows: Int64(numRows), columnWriters: colWriters
         )
         fileWriter.addRowGroup(&rowGroupWriter)
+        rowGroupOrdinal += 1
     }
 
     /// Write rows of nested data (for schemas with List/Map/Struct columns).
@@ -229,15 +245,11 @@ public struct ParquetFileWriter {
                 "Shredded \(shredded.count) columns but schema has \(schemaCols.count)")
         }
 
-        let colOpts = ColumnWriteOptions(
-            compression: writeOptions.compression,
-            useDictionary: writeOptions.useDictionary,
-            enableStatistics: writeOptions.enableStatistics,
-            dataPageVersion: writeOptions.dataPageVersion
-        )
+        let rgOrd = rowGroupOrdinal
 
         var colWriters: [AnyColumnWriter] = []
         for (i, col) in shredded.enumerated() {
+            let colOpts = makeColumnWriteOptions(columnOrdinal: Int16(i), rowGroupOrdinal: rgOrd, columnPath: schemaCols[i].name)
             let desc = ColumnDescriptor(node: schemaCols[i])
             switch col.physicalType {
             case .byteArray:
@@ -300,6 +312,16 @@ public struct ParquetFileWriter {
             schema: schema, numRows: Int64(rows.count), columnWriters: colWriters
         )
         fileWriter.addRowGroup(&rowGroupWriter)
+        rowGroupOrdinal += 1
+    }
+
+    private func makeColumnWriteOptions(columnOrdinal: Int16, rowGroupOrdinal: Int16, columnPath: String) -> ColumnWriteOptions {
+        ColumnWriteOptions(
+            compression: writeOptions.compression,
+            useDictionary: writeOptions.useDictionary,
+            enableStatistics: writeOptions.enableStatistics,
+            dataPageVersion: writeOptions.dataPageVersion
+        )
     }
 
     public mutating func close() throws {

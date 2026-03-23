@@ -185,16 +185,25 @@ enum SnappyCompressor {
 
             func emitCopy(offset: Int, length: Int) {
                 var remaining = length
-                // Emit copy2 for lengths > 64 or offsets > 2047
                 while remaining > 0 {
                     if remaining >= 4 && remaining <= 11 && offset <= 2047 {
-                        // copy1: 1-byte offset
+                        // copy1: 1-byte offset, length 4..11
                         let tag = UInt8(((remaining - 4) << 2) | ((offset >> 8) << 5) | 0x01)
                         output.append(tag)
                         output.append(UInt8(offset & 0xFF))
                         remaining = 0
+                    } else if offset > 65535 {
+                        // copy4: 4-byte offset, length 1..64
+                        let len = min(remaining, 64)
+                        let tag = UInt8(((len - 1) << 2) | 0x03)
+                        output.append(tag)
+                        output.append(UInt8(offset & 0xFF))
+                        output.append(UInt8((offset >> 8) & 0xFF))
+                        output.append(UInt8((offset >> 16) & 0xFF))
+                        output.append(UInt8((offset >> 24) & 0xFF))
+                        remaining -= len
                     } else {
-                        // copy2: 2-byte offset
+                        // copy2: 2-byte offset, length 1..64
                         let len = min(remaining, 64)
                         let tag = UInt8(((len - 1) << 2) | 0x02)
                         output.append(tag)

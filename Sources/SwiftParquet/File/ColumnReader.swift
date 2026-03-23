@@ -10,6 +10,7 @@ struct ColumnChunkReader {
     let fileData: Data
     let maxDefLevel: Int16
     let maxRepLevel: Int16
+    var decryptor: PageDecryptor? = nil
 
     /// Read all values from this column chunk as ColumnValues.
     func readAll() throws -> ColumnValues {
@@ -23,7 +24,8 @@ struct ColumnChunkReader {
             if header.type == .dictionaryPage {
                 dictionary = try PageReader.readDictionaryPage(
                     from: fileData, at: offset, header: header,
-                    headerSize: headerSize, codec: columnMeta.codec
+                    headerSize: headerSize, codec: columnMeta.codec,
+                    decryptor: decryptor
                 )
                 offset += headerSize + Int(header.compressedPageSize)
             }
@@ -40,6 +42,7 @@ struct ColumnChunkReader {
         var encoding: Encoding = .plain
         var allDefLevels: [Int32]? = maxDefLevel > 0 ? [] : nil
         var allRepLevels: [Int32]? = maxRepLevel > 0 ? [] : nil
+        var dataPageCount = 0
 
         let totalExpected = columnMeta.numValues
         while totalValues < totalExpected {
@@ -54,19 +57,23 @@ struct ColumnChunkReader {
             }
 
             let page: DecodedDataPage
+            let pageOrd = Int16(dataPageCount)
             if header.type == .dataPageV2 {
                 page = try PageReader.readDataPageV2(
                     from: fileData, at: offset, header: header,
                     headerSize: headerSize, codec: columnMeta.codec,
-                    maxDefLevel: maxDefLevel, maxRepLevel: maxRepLevel
+                    maxDefLevel: maxDefLevel, maxRepLevel: maxRepLevel,
+                    decryptor: decryptor, pageOrdinal: pageOrd
                 )
             } else {
                 page = try PageReader.readDataPage(
                     from: fileData, at: offset, header: header,
                     headerSize: headerSize, codec: columnMeta.codec,
-                    maxDefLevel: maxDefLevel, maxRepLevel: maxRepLevel
+                    maxDefLevel: maxDefLevel, maxRepLevel: maxRepLevel,
+                    decryptor: decryptor, pageOrdinal: pageOrd
                 )
             }
+            dataPageCount += 1
 
             encoding = page.encoding
             allValueData.append(page.valueData)

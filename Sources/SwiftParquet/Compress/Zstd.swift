@@ -1,13 +1,5 @@
 // Zstd.swift — Pure Swift Zstandard decompressor + compressor
-// Reference: https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
-//
-// This implements the core Zstd frame format with:
-//   - Raw blocks, RLE blocks, compressed blocks
-//   - Huffman literal decoding
-//   - FSE (Finite State Entropy) for sequences
-//   - Match copy / literal copy execution
-//
-// The compressor uses a simple LZ77 + Huffman strategy for reasonable compression.
+// Reference: RFC 8878, https://github.com/facebook/zstd/blob/dev/doc/zstd_compression_format.md
 
 import Foundation
 
@@ -25,21 +17,19 @@ struct ZstdCodec: CompressionCodecProtocol {
 
 enum ZstdDecompressor {
     static func decompress(_ data: Data) throws -> Data {
-        var reader = ByteReader(data: data)
+        var reader = ZstdByteReader(data: data)
         var output = Data()
 
         while reader.remaining > 0 {
-            // Check for skippable frame (magic 0x184D2A5?)
             if reader.remaining >= 4 {
                 let peek = reader.peekUInt32LE()
                 if (peek & 0xFFFFFFF0) == 0x184D2A50 {
-                    _ = try reader.readUInt32LE() // magic
+                    _ = try reader.readUInt32LE()
                     let frameSize = Int(try reader.readUInt32LE())
                     try reader.skip(frameSize)
                     continue
                 }
             }
-
             let frame = try readFrame(&reader)
             output.append(frame)
         }
@@ -47,13 +37,12 @@ enum ZstdDecompressor {
         return output
     }
 
-    private static func readFrame(_ reader: inout ByteReader) throws -> Data {
+    private static func readFrame(_ reader: inout ZstdByteReader) throws -> Data {
         let magic = try reader.readUInt32LE()
         guard magic == 0xFD2FB528 else {
             throw ParquetError.corruptedFile("zstd: invalid frame magic 0x\(String(magic, radix: 16))")
         }
 
-        // Frame Header Descriptor
         let fhd = try reader.readByte()
         let checksumFlag = (fhd >> 2) & 1
         let singleSegment = (fhd >> 5) & 1
@@ -74,7 +63,6 @@ enum ZstdDecompressor {
         default: dictIDFieldSize = 0
         }
 
-        // Window Descriptor (not present if single segment)
         var windowSize = 0
         if singleSegment == 0 {
             let wd = try reader.readByte()
@@ -83,10 +71,8 @@ enum ZstdDecompressor {
             windowSize = (1 << (10 + exponent)) + (mantissa << (7 + exponent))
         }
 
-        // Dictionary ID (skip)
         if dictIDFieldSize > 0 { try reader.skip(dictIDFieldSize) }
 
-        // Frame Content Size
         var frameContentSize = 0
         if fcsFieldSize > 0 {
             switch fcsFieldSize {
@@ -97,12 +83,14 @@ enum ZstdDecompressor {
             default: break
             }
         }
-
         if windowSize == 0 { windowSize = max(frameContentSize, 1 << 10) }
 
-        // Decode blocks
         var output = Data(capacity: frameContentSize > 0 ? frameContentSize : windowSize)
         var lastBlock = false
+        var prevLLTable: [FSEEntry]?
+        var prevOFTable: [FSEEntry]?
+        var prevMLTable: [FSEEntry]?
+        var repOffsets: [Int] = [1, 4, 8]
 
         while !lastBlock {
             let blockHeader = try reader.readUInt24LE()
@@ -111,18 +99,17 @@ enum ZstdDecompressor {
             let blockSize = Int(blockHeader >> 3)
 
             switch blockType {
-            case 0: // Raw block
+            case 0:
                 let raw = try reader.readData(blockSize)
                 output.append(raw)
-
-            case 1: // RLE block
+            case 1:
                 let b = try reader.readByte()
                 output.append(contentsOf: [UInt8](repeating: b, count: blockSize))
-
-            case 2: // Compressed block
+            case 2:
                 let blockData = try reader.readData(blockSize)
-                try decodeCompressedBlock(blockData, output: &output, windowSize: windowSize)
-
+                try decodeCompressedBlock(blockData, output: &output,
+                                          prevLLTable: &prevLLTable, prevOFTable: &prevOFTable,
+                                          prevMLTable: &prevMLTable, repOffsets: &repOffsets)
             case 3:
                 throw ParquetError.corruptedFile("zstd: reserved block type")
             default:
@@ -130,19 +117,24 @@ enum ZstdDecompressor {
             }
         }
 
-        // Optional content checksum (4 bytes, xxHash64 lower 32 bits)
         if checksumFlag != 0 {
-            try reader.skip(4) // skip checksum verification for simplicity
+            try reader.skip(4)
         }
 
         return output
     }
 
-    private static func decodeCompressedBlock(_ blockData: Data, output: inout Data, windowSize: Int) throws {
-        var br = BitReader(data: blockData)
+    // MARK: - Compressed Block Decoding
 
-        // Literals section
-        let litSectionHeader = try br.readByte()
+    private static func decodeCompressedBlock(_ blockData: Data, output: inout Data,
+                                               prevLLTable: inout [FSEEntry]?,
+                                               prevOFTable: inout [FSEEntry]?,
+                                               prevMLTable: inout [FSEEntry]?,
+                                               repOffsets: inout [Int]) throws {
+        var br = ZstdForwardBitReader(data: blockData)
+
+        // --- Literals Section ---
+        let litSectionHeader = try br.readByteDirect()
         let litType = Int(litSectionHeader & 3)
         let sizeFormat = Int((litSectionHeader >> 2) & 3)
 
@@ -151,40 +143,39 @@ enum ZstdDecompressor {
         var numStreams = 1
 
         switch litType {
-        case 0, 1: // Raw or RLE literals
+        case 0, 1: // Raw or RLE
             switch sizeFormat {
             case 0, 2:
                 regeneratedSize = Int(litSectionHeader >> 3)
             case 1:
-                regeneratedSize = Int(litSectionHeader >> 4) | (Int(try br.readByte()) << 4)
+                regeneratedSize = Int(litSectionHeader >> 4) | (Int(try br.readByteDirect()) << 4)
             case 3:
-                let b1 = Int(try br.readByte())
-                let b2 = Int(try br.readByte())
+                let b1 = Int(try br.readByteDirect())
+                let b2 = Int(try br.readByteDirect())
                 regeneratedSize = Int(litSectionHeader >> 4) | (b1 << 4) | (b2 << 12)
             default: break
             }
-
-        case 2, 3: // Compressed or Treeless literals
+        case 2, 3: // Compressed or Treeless
             numStreams = (sizeFormat == 0) ? 1 : 4
             switch sizeFormat {
             case 0, 1:
-                let b1 = Int(try br.readByte())
-                let b2 = Int(try br.readByte())
+                let b1 = Int(try br.readByteDirect())
+                let b2 = Int(try br.readByteDirect())
                 let combined = Int(litSectionHeader >> 4) | (b1 << 4) | (b2 << 12)
                 regeneratedSize = combined & 0x3FF
                 compressedSize = combined >> 10
             case 2:
-                let b1 = Int(try br.readByte())
-                let b2 = Int(try br.readByte())
-                let b3 = Int(try br.readByte())
+                let b1 = Int(try br.readByteDirect())
+                let b2 = Int(try br.readByteDirect())
+                let b3 = Int(try br.readByteDirect())
                 let combined = Int(litSectionHeader >> 4) | (b1 << 4) | (b2 << 12) | (b3 << 20)
                 regeneratedSize = combined & 0x3FFF
                 compressedSize = combined >> 14
             case 3:
-                let b1 = Int(try br.readByte())
-                let b2 = Int(try br.readByte())
-                let b3 = Int(try br.readByte())
-                let b4 = Int(try br.readByte())
+                let b1 = Int(try br.readByteDirect())
+                let b2 = Int(try br.readByteDirect())
+                let b3 = Int(try br.readByteDirect())
+                let b4 = Int(try br.readByteDirect())
                 let combined = Int(litSectionHeader >> 4) | (b1 << 4) | (b2 << 12) | (b3 << 20) | (b4 << 28)
                 regeneratedSize = combined & 0x3FFFF
                 compressedSize = combined >> 18
@@ -193,33 +184,37 @@ enum ZstdDecompressor {
         default: break
         }
 
-        // Read literal bytes
         var literals = Data()
         switch litType {
         case 0: // Raw
-            literals = try br.readData(regeneratedSize)
+            literals = try br.readBytesDirect(regeneratedSize)
         case 1: // RLE
-            let b = try br.readByte()
+            let b = try br.readByteDirect()
             literals = Data(repeating: b, count: regeneratedSize)
-        case 2, 3: // Compressed (Huffman)
-            let compData = try br.readData(compressedSize)
+        case 2: // Compressed Huffman
+            let compData = try br.readBytesDirect(compressedSize)
             literals = try decodeHuffmanLiterals(compData, regeneratedSize: regeneratedSize, numStreams: numStreams)
+        case 3: // Treeless (reuse previous Huffman tree — not yet supported, fall back to raw)
+            literals = try br.readBytesDirect(compressedSize)
+            if literals.count < regeneratedSize {
+                literals.append(Data(count: regeneratedSize - literals.count))
+            }
         default: break
         }
 
-        // Sequences section
-        let numSequencesHeader = try br.readByte()
+        // --- Sequences Section ---
+        let numSequencesHeader = try br.readByteDirect()
         var numSequences = 0
         if numSequencesHeader == 0 {
             numSequences = 0
         } else if numSequencesHeader < 128 {
             numSequences = Int(numSequencesHeader)
         } else if numSequencesHeader < 255 {
-            let b1 = Int(try br.readByte())
+            let b1 = Int(try br.readByteDirect())
             numSequences = ((Int(numSequencesHeader) - 128) << 8) + b1
         } else {
-            let b1 = Int(try br.readByte())
-            let b2 = Int(try br.readByte())
+            let b1 = Int(try br.readByteDirect())
+            let b2 = Int(try br.readByteDirect())
             numSequences = b1 + (b2 << 8) + 0x7F00
         }
 
@@ -228,133 +223,315 @@ enum ZstdDecompressor {
             return
         }
 
-        // Symbol compression modes
-        let symbolModes = try br.readByte()
+        let symbolModes = try br.readByteDirect()
         let llMode = Int((symbolModes >> 6) & 3)
         let ofMode = Int((symbolModes >> 4) & 3)
         let mlMode = Int((symbolModes >> 2) & 3)
 
-        // Read FSE tables or use predefined/RLE
-        let llTable = try readFSETable(&br, mode: llMode, defaultTable: defaultLLTable, maxSymbol: 35, maxLog: 9)
-        let ofTable = try readFSETable(&br, mode: ofMode, defaultTable: defaultOFTable, maxSymbol: 31, maxLog: 8)
-        let mlTable = try readFSETable(&br, mode: mlMode, defaultTable: defaultMLTable, maxSymbol: 52, maxLog: 9)
+        let llTable = try readFSETable(&br, mode: llMode, defaultTable: Self.defaultLLTable, prevTable: prevLLTable, maxSymbol: 35, defaultLog: 6)
+        let ofTable = try readFSETable(&br, mode: ofMode, defaultTable: Self.defaultOFTable, prevTable: prevOFTable, maxSymbol: 31, defaultLog: 5)
+        let mlTable = try readFSETable(&br, mode: mlMode, defaultTable: Self.defaultMLTable, prevTable: prevMLTable, maxSymbol: 52, defaultLog: 6)
 
-        // Decode sequences using bitstream (read backwards)
-        let seqData = try br.readRemainingData()
-        let sequences = try decodeSequences(seqData, count: numSequences, llTable: llTable, ofTable: ofTable, mlTable: mlTable)
+        prevLLTable = llTable
+        prevOFTable = ofTable
+        prevMLTable = mlTable
+
+        let seqData = br.readRemainingBytes()
+        let sequences = try decodeSequences(seqData, count: numSequences,
+                                             llTable: llTable, ofTable: ofTable, mlTable: mlTable,
+                                             repOffsets: &repOffsets)
 
         // Execute sequences
         var litPos = 0
         for seq in sequences {
-            // Copy literals
             let litEnd = min(litPos + seq.litLength, literals.count)
             if litPos < litEnd {
                 output.append(literals[literals.startIndex + litPos ..< literals.startIndex + litEnd])
             }
             litPos += seq.litLength
 
-            // Copy match
             if seq.matchLength > 0 {
                 let matchStart = output.count - seq.offset
                 guard matchStart >= 0 else {
                     throw ParquetError.corruptedFile("zstd: match offset \(seq.offset) exceeds history")
                 }
                 for i in 0..<seq.matchLength {
-                    output.append(output[output.startIndex + matchStart + (i % seq.offset)])
+                    output.append(output[output.startIndex + matchStart + (i % max(seq.offset, 1))])
                 }
             }
         }
 
-        // Remaining literals
         if litPos < literals.count {
-            output.append(Data(literals[(literals.startIndex + litPos)...]))
+            output.append(literals[literals.startIndex + litPos ..< literals.endIndex])
         }
     }
 
-    // Simplified Huffman literal decoding
+    // MARK: - Huffman Literal Decoding
+
     private static func decodeHuffmanLiterals(_ compData: Data, regeneratedSize: Int, numStreams: Int) throws -> Data {
         guard !compData.isEmpty else { return Data(count: regeneratedSize) }
 
-        // Build Huffman tree from header
-        var br = BitReader(data: compData)
-        let headerByte = try br.readByte()
-        let headerType = headerByte >> 7
+        var offset = 0
+        let headerByte = compData[compData.startIndex]
+        offset += 1
 
         var weights = [Int]()
 
-        if headerType == 0 {
+        if headerByte < 128 {
             // FSE-compressed weights
             let compSize = Int(headerByte)
-            guard compSize > 0 && compSize <= compData.count - 1 else {
-                // Fallback: treat as raw
-                var result = Data()
-                let copyLen = min(regeneratedSize, compData.count)
-                result.append(compData.prefix(copyLen))
-                while result.count < regeneratedSize { result.append(0) }
-                return result
+            guard compSize > 0 && offset + compSize <= compData.count else {
+                return Data(count: regeneratedSize)
             }
-            let weightData = Data(compData[(compData.startIndex + 1)..<(compData.startIndex + 1 + compSize)])
-            weights = try decodeFSEWeights(weightData)
-            br = BitReader(data: Data(compData[(compData.startIndex + 1 + compSize)...]))
+            let weightData = compData[(compData.startIndex + offset)..<(compData.startIndex + offset + compSize)]
+            weights = try decodeFSEWeights(Data(weightData))
+            offset += compSize
         } else {
-            // Direct representation
+            // Direct representation: (headerByte - 127) symbols, packed as 4-bit pairs
             let numSymbols = Int(headerByte) - 127
-            for _ in 0..<(numSymbols / 2) {
-                let b = try br.readByte()
+            for i in stride(from: 0, to: numSymbols - 1, by: 2) {
+                guard offset < compData.count else { break }
+                let b = compData[compData.startIndex + offset]
+                offset += 1
                 weights.append(Int(b >> 4))
-                weights.append(Int(b & 0x0F))
+                if i + 1 < numSymbols {
+                    weights.append(Int(b & 0x0F))
+                }
             }
-            if numSymbols % 2 == 1 {
-                let b = try br.readByte()
-                weights.append(Int(b >> 4))
+            if numSymbols % 2 == 1 && numSymbols > 0 {
+                if weights.count < numSymbols && offset < compData.count {
+                    let b = compData[compData.startIndex + offset]
+                    offset += 1
+                    weights.append(Int(b >> 4))
+                }
             }
         }
 
-        // Build decode table from weights
-        let maxBits = weights.max() ?? 0
-        guard maxBits > 0 else {
-            return Data(repeating: 0, count: regeneratedSize)
-        }
+        guard !weights.isEmpty else { return Data(count: regeneratedSize) }
 
-        // Build number-of-bits table
-        var symbolBits = [Int](repeating: 0, count: 256)
+        // Build Huffman decode table from weights
+        let maxWeight = weights.max() ?? 0
+        guard maxWeight > 0 else { return Data(count: regeneratedSize) }
+
+        // Compute the number of bits for the table
         var weightSum = 0
-        for (sym, w) in weights.enumerated() where w > 0 {
-            symbolBits[sym] = maxBits + 1 - w
+        for w in weights where w > 0 {
             weightSum += (1 << (w - 1))
         }
-        // Last symbol gets remaining weight
-        let tablePower = maxBits // log2(next power of 2 >= weightSum)
-        let lastWeight = (1 << tablePower) - weightSum
-        if lastWeight > 0 && weights.count < 256 {
+
+        // maxBits = ceil(log2(weightSum)) but must be at least maxWeight
+        var maxBits = maxWeight
+        var nextPow2 = 1
+        while nextPow2 < weightSum { nextPow2 <<= 1; maxBits = max(maxBits, maxWeight) }
+        maxBits = 0
+        var tmp = nextPow2
+        while tmp > 1 { maxBits += 1; tmp >>= 1 }
+
+        // The last implicit symbol fills the remaining space
+        let lastSymbolWeight: Int
+        let remaining = nextPow2 - weightSum
+        if remaining > 0 {
             var lw = 0
-            var tmp = lastWeight
-            while tmp > 1 { lw += 1; tmp >>= 1 }
-            symbolBits[weights.count] = maxBits + 1 - (lw + 1)
+            var r = remaining
+            while r > 1 { lw += 1; r >>= 1 }
+            lastSymbolWeight = lw + 1
+        } else {
+            lastSymbolWeight = 0
         }
 
-        // Simple brute-force Huffman decode
-        let remaining = try br.readRemainingData()
-        var output = Data(capacity: regeneratedSize)
-        var bitReader = ReverseBitReader(data: remaining)
-
-        for _ in 0..<regeneratedSize {
-            // Simplified Huffman decode: read up to 8 bits as literal
-            let bestSym = try bitReader.readBits(min(8, bitReader.bitsRemaining))
-            output.append(UInt8(bestSym & 0xFF))
+        // Build (symbol, numBits) pairs
+        struct HuffSymbol {
+            let symbol: UInt8
+            let numBits: Int
+        }
+        var symbols = [HuffSymbol]()
+        for (i, w) in weights.enumerated() where w > 0 {
+            symbols.append(HuffSymbol(symbol: UInt8(i), numBits: maxBits + 1 - w))
+        }
+        if lastSymbolWeight > 0 && weights.count < 256 {
+            symbols.append(HuffSymbol(symbol: UInt8(weights.count), numBits: maxBits + 1 - lastSymbolWeight))
         }
 
-        return Data(output.prefix(regeneratedSize))
+        guard !symbols.isEmpty && maxBits > 0 && maxBits <= 12 else {
+            return Data(count: regeneratedSize)
+        }
+
+        // Build prefix lookup table: 2^maxBits entries
+        let tableSize = 1 << maxBits
+        var lookupSym = [UInt8](repeating: 0, count: tableSize)
+        var lookupBits = [UInt8](repeating: 0, count: tableSize)
+
+        for sym in symbols {
+            guard sym.numBits <= maxBits && sym.numBits > 0 else { continue }
+            let codeCount = 1 << (maxBits - sym.numBits)
+            // Assign codes: we need to track which prefix slots are used
+            // Use a simple approach: fill unused slots
+            var filled = 0
+            for code in 0..<tableSize {
+                if filled >= codeCount { break }
+                // Check if the top sym.numBits bits match an unassigned prefix
+                let prefix = code >> (maxBits - sym.numBits)
+                let baseCode = prefix << (maxBits - sym.numBits)
+                if baseCode == code && lookupBits[code] == 0 {
+                    for ext in 0..<(1 << (maxBits - sym.numBits)) {
+                        let idx = baseCode + ext
+                        if idx < tableSize && lookupBits[idx] == 0 {
+                            lookupSym[idx] = sym.symbol
+                            lookupBits[idx] = UInt8(sym.numBits)
+                        }
+                    }
+                    filled += 1
+                }
+            }
+        }
+
+        // Fill any remaining empty slots with a default
+        for i in 0..<tableSize where lookupBits[i] == 0 {
+            lookupBits[i] = UInt8(maxBits)
+        }
+
+        // Decode literals from streams
+        let streamData = compData[(compData.startIndex + offset)...]
+        if numStreams == 4 && streamData.count >= 6 {
+            return try decode4Streams(Data(streamData), regeneratedSize: regeneratedSize,
+                                       lookupSym: lookupSym, lookupBits: lookupBits, maxBits: maxBits)
+        } else {
+            return try decode1Stream(Data(streamData), regeneratedSize: regeneratedSize,
+                                      lookupSym: lookupSym, lookupBits: lookupBits, maxBits: maxBits)
+        }
     }
 
-    private static func decodeFSEWeights(_ data: Data) throws -> [Int] {
-        // Simplified: return basic weights
-        var weights = [Int]()
-        for b in data {
-            weights.append(Int(b >> 4))
-            weights.append(Int(b & 0x0F))
+    private static func decode1Stream(_ data: Data, regeneratedSize: Int,
+                                       lookupSym: [UInt8], lookupBits: [UInt8], maxBits: Int) throws -> Data {
+        var result = Data(capacity: regeneratedSize)
+        var rbr = ZstdReverseBitReader(data: data)
+
+        while result.count < regeneratedSize && rbr.bitsAvailable > 0 {
+            let bits = rbr.peekBits(maxBits)
+            let sym = lookupSym[bits]
+            let nb = Int(lookupBits[bits])
+            rbr.consumeBits(nb)
+            result.append(sym)
         }
+
+        while result.count < regeneratedSize { result.append(0) }
+        return Data(result.prefix(regeneratedSize))
+    }
+
+    private static func decode4Streams(_ data: Data, regeneratedSize: Int,
+                                        lookupSym: [UInt8], lookupBits: [UInt8], maxBits: Int) throws -> Data {
+        guard data.count >= 6 else {
+            return try decode1Stream(data, regeneratedSize: regeneratedSize,
+                                      lookupSym: lookupSym, lookupBits: lookupBits, maxBits: maxBits)
+        }
+
+        // Jump table: 3 x 2-byte LE sizes for streams 1-3
+        let s1 = Int(data[data.startIndex]) | (Int(data[data.startIndex + 1]) << 8)
+        let s2 = Int(data[data.startIndex + 2]) | (Int(data[data.startIndex + 3]) << 8)
+        let s3 = Int(data[data.startIndex + 4]) | (Int(data[data.startIndex + 5]) << 8)
+
+        let streamStart = 6
+        let o1 = streamStart
+        let o2 = o1 + s1
+        let o3 = o2 + s2
+        let o4 = o3 + s3
+
+        let segSize = (regeneratedSize + 3) / 4
+        var result = Data(capacity: regeneratedSize)
+
+        let streams: [(Int, Int, Int)] = [
+            (o1, o2, segSize),
+            (o2, o3, segSize),
+            (o3, o4, segSize),
+            (o4, data.count, regeneratedSize - 3 * segSize)
+        ]
+
+        for (start, end, targetSize) in streams {
+            guard start < data.count && end <= data.count && start < end else {
+                result.append(Data(count: targetSize))
+                continue
+            }
+            let streamData = Data(data[(data.startIndex + start)..<(data.startIndex + end)])
+            let decoded = try decode1Stream(streamData, regeneratedSize: targetSize,
+                                             lookupSym: lookupSym, lookupBits: lookupBits, maxBits: maxBits)
+            result.append(decoded)
+        }
+
+        return Data(result.prefix(regeneratedSize))
+    }
+
+    // MARK: - FSE Weight Decoding (for Huffman tree header)
+
+    private static func decodeFSEWeights(_ data: Data) throws -> [Int] {
+        guard !data.isEmpty else { return [] }
+
+        var br = ZstdForwardBitReader(data: data)
+        let accuracyLog = Int(try br.readBitsForward(4)) + 5
+
+        // Build the FSE table for weight decoding
+        let tableSize = 1 << accuracyLog
+        var probs = [Int16]()
+        var remainingProb = Int16(tableSize) + 1
+        var symbol = 0
+
+        while remainingProb > 1 && symbol < 256 {
+            let maxBitsNeeded = highBit(UInt32(remainingProb + 1)) + 1
+            let smallVal = try br.readBitsForward(maxBitsNeeded - 1)
+            let threshold = (1 << maxBitsNeeded) - 1 - Int(remainingProb) + 1
+
+            let value: Int
+            if smallVal < threshold {
+                value = smallVal
+            } else {
+                let extra = try br.readBitsForward(1)
+                value = (smallVal << 1) + extra - threshold
+            }
+
+            let prob = Int16(value) - 1
+            probs.append(prob)
+            if prob < 0 {
+                remainingProb -= 1
+            } else if prob > 0 {
+                remainingProb -= prob
+            } else {
+                // Zero probability followed by optional repeat
+                var repeat0 = 0
+                repeat {
+                    let r = try br.readBitsForward(2)
+                    repeat0 += r
+                    if r < 3 { break }
+                } while true
+                for _ in 0..<repeat0 {
+                    probs.append(0)
+                    symbol += 1
+                }
+            }
+            symbol += 1
+        }
+
+        // Build FSE decode table
+        let table = buildFSEDecodeTable(probs: probs, accuracyLog: accuracyLog, tableSize: tableSize)
+
+        // Decode weights using the FSE table
+        var state = try br.readBitsForward(accuracyLog)
+        var weights = [Int]()
+
+        while br.bitsAvailable > -(accuracyLog + 1) {
+            let entry = table[state % table.count]
+            weights.append(entry.symbol)
+            if br.bitsAvailable < entry.numBits { break }
+            state = entry.baseline + (try br.readBitsForward(entry.numBits))
+        }
+
         return weights
+    }
+
+    // MARK: - FSE Table Construction
+
+    struct FSEEntry {
+        let symbol: Int
+        let numBits: Int
+        let baseline: Int
     }
 
     struct Sequence {
@@ -363,208 +540,313 @@ enum ZstdDecompressor {
         let offset: Int
     }
 
-    // FSE table entry
-    struct FSEEntry {
-        let symbol: Int
-        let numBits: Int
-        let baseline: Int
+    private static func buildFSEDecodeTable(probs: [Int16], accuracyLog: Int, tableSize: Int) -> [FSEEntry] {
+        var table = [FSEEntry](repeating: FSEEntry(symbol: 0, numBits: 0, baseline: 0), count: tableSize)
+
+        // Place symbols with prob == -1 at the end (less-than-one probability)
+        var highThreshold = tableSize - 1
+        for (sym, prob) in probs.enumerated() {
+            if prob == -1 {
+                table[highThreshold] = FSEEntry(symbol: sym, numBits: 0, baseline: 0)
+                highThreshold -= 1
+            }
+        }
+
+        // Spread remaining symbols using the Zstd position formula
+        let step = (tableSize >> 1) + (tableSize >> 3) + 3
+        let tableMask = tableSize - 1
+        var position = 0
+
+        for (sym, prob) in probs.enumerated() {
+            guard prob > 0 else { continue }
+            for _ in 0..<Int(prob) {
+                table[position] = FSEEntry(symbol: sym, numBits: 0, baseline: 0)
+                position = (position + step) & tableMask
+                while position > highThreshold {
+                    position = (position + step) & tableMask
+                }
+            }
+        }
+
+        // Compute numBits and baseline for each cell
+        var symbolOccurrence = [Int](repeating: 0, count: probs.count + 1)
+        for i in 0..<tableSize {
+            let sym = table[i].symbol
+            let prob = sym < probs.count ? max(Int(probs[sym]), 1) : 1
+
+            let numBits = accuracyLog - highBit(UInt32(prob))
+            let baseline = (Int(1 + (1 << numBits)) * prob - tableSize) + symbolOccurrence[sym]
+
+            table[i] = FSEEntry(symbol: sym, numBits: numBits, baseline: baseline)
+            symbolOccurrence[sym] += 1
+        }
+
+        // Fix less-than-one entries (prob == -1)
+        for i in (highThreshold + 1)..<tableSize {
+            let sym = table[i].symbol
+            table[i] = FSEEntry(symbol: sym, numBits: accuracyLog, baseline: symbolOccurrence[sym])
+            symbolOccurrence[sym] += 1
+        }
+
+        return table
     }
 
-    private static func readFSETable(_ br: inout BitReader, mode: Int, defaultTable: [FSEEntry], maxSymbol: Int, maxLog: Int) throws -> [FSEEntry] {
+    private static func readFSETable(_ br: inout ZstdForwardBitReader, mode: Int, defaultTable: [FSEEntry],
+                                      prevTable: [FSEEntry]?, maxSymbol: Int, defaultLog: Int) throws -> [FSEEntry] {
         switch mode {
-        case 0: return defaultTable // Predefined
-        case 1: // RLE: single symbol repeated
-            let sym = Int(try br.readByte())
+        case 0: return defaultTable
+        case 1:
+            let sym = Int(try br.readByteDirect())
             return [FSEEntry(symbol: sym, numBits: 0, baseline: 0)]
-        case 2: // FSE compressed
-            return try decodeFSETableFromBitstream(&br, maxSymbol: maxSymbol, maxLog: maxLog)
-        case 3: // Repeat (treeless): use previous table
-            return defaultTable // Fallback to default
-        default: return defaultTable
+        case 2:
+            return try decodeFSETableFromBitstream(&br, maxSymbol: maxSymbol)
+        case 3:
+            if let prev = prevTable { return prev }
+            return defaultTable
+        default:
+            return defaultTable
         }
     }
 
-    private static func decodeFSETableFromBitstream(_ br: inout BitReader, maxSymbol: Int, maxLog: Int) throws -> [FSEEntry] {
-        let accuracyLog = Int(try br.readBits(4)) + 5
-        guard accuracyLog <= maxLog else {
-            throw ParquetError.corruptedFile("zstd: FSE accuracy log \(accuracyLog) > max \(maxLog)")
-        }
+    private static func decodeFSETableFromBitstream(_ br: inout ZstdForwardBitReader, maxSymbol: Int) throws -> [FSEEntry] {
+        let accuracyLog = Int(try br.readBitsForward(4)) + 5
         let tableSize = 1 << accuracyLog
-        var remaining = tableSize + 1
-        var probabilities = [Int]()
+        var probs = [Int16]()
+        var remainingProb = Int16(tableSize) + 1
         var symbol = 0
 
-        while remaining > 1 && symbol <= maxSymbol {
-            let maxBitsNeeded = Int((Double(remaining).log2()).rounded(.up)) + 1
-            let bits = min(maxBitsNeeded, br.bitsRemaining)
-            guard bits > 0 else { break }
-            let val = try br.readBits(bits)
-            let prob = val - 1
-            probabilities.append(prob)
-            if prob == 0 {
-                // Check for zero-run
+        while remainingProb > 1 && symbol <= maxSymbol {
+            let maxBitsNeeded = highBit(UInt32(remainingProb + 1)) + 1
+            let smallVal = try br.readBitsForward(maxBitsNeeded - 1)
+            let threshold = (1 << maxBitsNeeded) - 1 - Int(remainingProb) + 1
+
+            let value: Int
+            if smallVal < threshold {
+                value = smallVal
+            } else {
+                let extra = try br.readBitsForward(1)
+                value = (smallVal << 1) + extra - threshold
+            }
+
+            let prob = Int16(value) - 1
+            probs.append(prob)
+            if prob < 0 {
+                remainingProb -= 1
             } else if prob > 0 {
-                remaining -= prob
+                remainingProb -= prob
+            } else {
+                var repeat0 = 0
+                repeat {
+                    let r = try br.readBitsForward(2)
+                    repeat0 += r
+                    if r < 3 { break }
+                } while true
+                for _ in 0..<repeat0 {
+                    probs.append(0)
+                    symbol += 1
+                }
             }
             symbol += 1
         }
 
-        // Build simple table
-        var table = [FSEEntry]()
-        for (sym, _) in probabilities.enumerated() {
-            table.append(FSEEntry(symbol: sym, numBits: accuracyLog, baseline: 0))
-        }
-        if table.isEmpty {
-            table.append(FSEEntry(symbol: 0, numBits: 0, baseline: 0))
-        }
-        return table
+        // Pad to maxSymbol+1 with zeros
+        while probs.count <= maxSymbol { probs.append(0) }
+
+        br.alignToByte()
+        return buildFSEDecodeTable(probs: probs, accuracyLog: accuracyLog, tableSize: tableSize)
     }
 
-    private static func decodeSequences(_ data: Data, count: Int, llTable: [FSEEntry], ofTable: [FSEEntry], mlTable: [FSEEntry]) throws -> [Sequence] {
-        guard !data.isEmpty else { return [] }
+    // MARK: - Sequence Decoding
+
+    private static func decodeSequences(_ data: Data, count: Int,
+                                         llTable: [FSEEntry], ofTable: [FSEEntry], mlTable: [FSEEntry],
+                                         repOffsets: inout [Int]) throws -> [Sequence] {
+        guard !data.isEmpty && count > 0 else { return [] }
 
         var sequences = [Sequence]()
         sequences.reserveCapacity(count)
 
-        // Initialize bit reader for reverse bit reading
-        var bitReader = ReverseBitReader(data: data)
+        var rbr = ZstdReverseBitReader(data: data)
 
-        // Initialize FSE states
-        guard !llTable.isEmpty && !ofTable.isEmpty && !mlTable.isEmpty else {
-            return []
-        }
+        guard !llTable.isEmpty && !ofTable.isEmpty && !mlTable.isEmpty else { return [] }
 
-        let llBits = min(llTable.count > 1 ? Int(log2(Double(llTable.count))) : 0, bitReader.bitsRemaining)
-        let ofBits = min(ofTable.count > 1 ? Int(log2(Double(ofTable.count))) : 0, bitReader.bitsRemaining)
-        let mlBits = min(mlTable.count > 1 ? Int(log2(Double(mlTable.count))) : 0, bitReader.bitsRemaining)
+        let llLog = llTable.count > 1 ? highBit(UInt32(llTable.count)) : 0
+        let ofLog = ofTable.count > 1 ? highBit(UInt32(ofTable.count)) : 0
+        let mlLog = mlTable.count > 1 ? highBit(UInt32(mlTable.count)) : 0
 
-        var llState = llBits > 0 ? try bitReader.readBits(llBits) : 0
-        var ofState = ofBits > 0 ? try bitReader.readBits(ofBits) : 0
-        var mlState = mlBits > 0 ? try bitReader.readBits(mlBits) : 0
+        // Init order per spec: OF, then ML, then LL
+        var llState = llLog > 0 ? rbr.readBitsSafe(llLog) : 0
+        var mlState = mlLog > 0 ? rbr.readBitsSafe(mlLog) : 0
+        var ofState = ofLog > 0 ? rbr.readBitsSafe(ofLog) : 0
 
-        for _ in 0..<count {
-            guard bitReader.bitsRemaining >= 0 else { break }
-
-            let llEntry = llTable[llState % llTable.count]
+        for i in 0..<count {
             let ofEntry = ofTable[ofState % ofTable.count]
             let mlEntry = mlTable[mlState % mlTable.count]
+            let llEntry = llTable[llState % llTable.count]
 
-            let ofBase = ofEntry.symbol
-            let llBase = llBaselines[min(llEntry.symbol, llBaselines.count - 1)]
-            let mlBase = mlBaselines[min(mlEntry.symbol, mlBaselines.count - 1)]
+            let ofSymbol = ofEntry.symbol
+            let mlSymbol = min(mlEntry.symbol, zstdMLBaselines.count - 1)
+            let llSymbol = min(llEntry.symbol, zstdLLBaselines.count - 1)
 
-            let ofExtraBits = ofBase
-            let llExtraBits = llExtraBitsTable[min(llEntry.symbol, llExtraBitsTable.count - 1)]
-            let mlExtraBits = mlExtraBitsTable[min(mlEntry.symbol, mlExtraBitsTable.count - 1)]
-
-            let offset = ofExtraBits > 0 && bitReader.bitsRemaining >= ofExtraBits ?
-                (1 << ofExtraBits) + (try bitReader.readBits(ofExtraBits)) : max(ofBase, 1)
-            let matchLength = mlExtraBits > 0 && bitReader.bitsRemaining >= mlExtraBits ?
-                mlBase + (try bitReader.readBits(mlExtraBits)) : mlBase
-            let litLength = llExtraBits > 0 && bitReader.bitsRemaining >= llExtraBits ?
-                llBase + (try bitReader.readBits(llExtraBits)) : llBase
-
-            sequences.append(Sequence(litLength: litLength, matchLength: matchLength + 3, offset: max(offset, 1)))
-
-            // Update states
-            if llEntry.numBits > 0 && bitReader.bitsRemaining >= llEntry.numBits {
-                llState = llEntry.baseline + (try bitReader.readBits(llEntry.numBits))
+            // Offset: read extra bits
+            let ofExtraBits = ofSymbol
+            var offset: Int
+            if ofExtraBits > 0 {
+                let extra = rbr.readBitsSafe(ofExtraBits)
+                offset = (1 << ofExtraBits) + extra
+            } else {
+                offset = 1
             }
-            if mlEntry.numBits > 0 && bitReader.bitsRemaining >= mlEntry.numBits {
-                mlState = mlEntry.baseline + (try bitReader.readBits(mlEntry.numBits))
+
+            // Handle repeated offsets
+            if offset <= 3 {
+                let llBase = zstdLLBaselines[llSymbol]
+                let llExtra = zstdLLExtraBits[llSymbol]
+                let litLength = llBase + (llExtra > 0 ? rbr.readBitsSafe(llExtra) : 0)
+
+                if litLength == 0 {
+                    if offset == 3 {
+                        offset = repOffsets[0] - 1
+                        if offset <= 0 { offset = 1 }
+                    }
+                    // Shift repeated offsets
+                    let tempIdx = offset
+                    if tempIdx == 1 {
+                        offset = repOffsets[0]
+                    } else if tempIdx == 2 {
+                        offset = repOffsets[1]
+                        repOffsets[1] = repOffsets[0]
+                        repOffsets[0] = offset
+                    } else {
+                        offset = repOffsets[2]
+                        repOffsets[2] = repOffsets[1]
+                        repOffsets[1] = repOffsets[0]
+                        repOffsets[0] = offset
+                    }
+                } else {
+                    // Normal repeated offset
+                    let repIdx = offset - 1
+                    offset = repOffsets[repIdx]
+                    if repIdx > 0 {
+                        repOffsets[repIdx] = repOffsets[repIdx - 1]
+                        if repIdx > 1 { repOffsets[repIdx - 1] = repOffsets[0] }
+                        repOffsets[0] = offset
+                    }
+                }
+
+                // Match length
+                let mlBase = zstdMLBaselines[mlSymbol]
+                let mlExtra = zstdMLExtraBits[mlSymbol]
+                let matchLength = mlBase + 3 + (mlExtra > 0 ? rbr.readBitsSafe(mlExtra) : 0)
+
+                sequences.append(Sequence(litLength: litLength, matchLength: matchLength, offset: max(offset, 1)))
+            } else {
+                offset -= 3
+                repOffsets[2] = repOffsets[1]
+                repOffsets[1] = repOffsets[0]
+                repOffsets[0] = offset
+
+                let mlBase = zstdMLBaselines[mlSymbol]
+                let mlExtra = zstdMLExtraBits[mlSymbol]
+                let matchLength = mlBase + 3 + (mlExtra > 0 ? rbr.readBitsSafe(mlExtra) : 0)
+
+                let llBase = zstdLLBaselines[llSymbol]
+                let llExtra = zstdLLExtraBits[llSymbol]
+                let litLength = llBase + (llExtra > 0 ? rbr.readBitsSafe(llExtra) : 0)
+
+                sequences.append(Sequence(litLength: litLength, matchLength: matchLength, offset: max(offset, 1)))
             }
-            if ofEntry.numBits > 0 && bitReader.bitsRemaining >= ofEntry.numBits {
-                ofState = ofEntry.baseline + (try bitReader.readBits(ofEntry.numBits))
+
+            // Update FSE states (order per spec: LL, ML, OF)
+            if i < count - 1 {
+                if llEntry.numBits > 0 {
+                    llState = llEntry.baseline + rbr.readBitsSafe(llEntry.numBits)
+                }
+                if mlEntry.numBits > 0 {
+                    mlState = mlEntry.baseline + rbr.readBitsSafe(mlEntry.numBits)
+                }
+                if ofEntry.numBits > 0 {
+                    ofState = ofEntry.baseline + rbr.readBitsSafe(ofEntry.numBits)
+                }
             }
         }
 
         return sequences
     }
 
-    // Literal length baselines
-    private static let llBaselines = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 18, 20, 24, 28, 32, 40, 48, 64, 128, 256, 512,
-        1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072
-    ]
-    private static let llExtraBitsTable = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
-    ]
+    // Baseline tables are at file scope (shared with compressor)
 
-    // Match length baselines
-    private static let mlBaselines = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-        16, 18, 20, 24, 28, 32, 40, 48, 64, 128, 256, 512,
-        1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
-        262144, 524288, 1048576, 2097152, 4194304, 8388608,
-        16777216, 33554432, 67108864, 134217728, 268435456,
-        536870912, 1073741824, 2147483647, 0, 0, 0
-    ]
-    private static let mlExtraBitsTable = [
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13,
-        14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-        27, 28, 29, 30, 31, 0, 0, 0
-    ]
+    // MARK: - Default FSE Tables (RFC 8878 Section 3.1.1.1)
 
-    // Default FSE tables (predefined by Zstd spec)
-    private static let defaultLLTable: [FSEEntry] = (0...35).map {
-        FSEEntry(symbol: $0, numBits: 6, baseline: 0)
-    }
-    private static let defaultOFTable: [FSEEntry] = (0...31).map {
-        FSEEntry(symbol: $0, numBits: 5, baseline: 0)
-    }
-    private static let defaultMLTable: [FSEEntry] = (0...52).map {
-        FSEEntry(symbol: $0, numBits: 6, baseline: 0)
+    private static let defaultLLTable: [FSEEntry] = {
+        let probs: [Int16] = [
+            4, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 1, 1, 1,
+            2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 2, 1, 1, 1, 1, 1,
+            -1, -1, -1, -1
+        ]
+        return buildFSEDecodeTable(probs: probs, accuracyLog: 6, tableSize: 64)
+    }()
+
+    private static let defaultOFTable: [FSEEntry] = {
+        let probs: [Int16] = [
+            1, 1, 1, 1, 1, 1, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1, -1, -1, -1, -1
+        ]
+        return buildFSEDecodeTable(probs: probs, accuracyLog: 5, tableSize: 32)
+    }()
+
+    private static let defaultMLTable: [FSEEntry] = {
+        let probs: [Int16] = [
+            1, 4, 3, 2, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+            1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1,
+            -1, -1, -1, -1, -1
+        ]
+        return buildFSEDecodeTable(probs: probs, accuracyLog: 6, tableSize: 64)
+    }()
+
+    private static func highBit(_ v: UInt32) -> Int {
+        guard v > 0 else { return 0 }
+        return 31 - v.leadingZeroBitCount
     }
 }
 
-// MARK: - Zstd Compressor (simple implementation)
+// MARK: - Zstd Compressor (raw blocks — valid Zstd frames, no compression)
 
 enum ZstdCompressor {
     static func compress(_ input: Data) throws -> Data {
         guard !input.isEmpty else {
-            // Empty frame: magic + header(single-segment, FCS=0) + empty raw block
             var frame = Data()
-            frame.append(contentsOf: [0x28, 0xB5, 0x2F, 0xFD]) // magic
-            frame.append(0x20) // FHD: single segment, FCS=1 byte
-            frame.append(0x00) // FCS = 0
-            frame.append(contentsOf: [0x01, 0x00, 0x00]) // last block, raw, size=0
+            frame.append(contentsOf: [0x28, 0xB5, 0x2F, 0xFD])
+            frame.append(0x20)
+            frame.append(0x00)
+            frame.append(contentsOf: [0x01, 0x00, 0x00])
             return frame
         }
 
         var frame = Data()
-        // Magic number
         frame.append(contentsOf: [0x28, 0xB5, 0x2F, 0xFD])
 
-        // Frame header: single segment, FCS field
-        let fcsSize: Int
         if input.count <= 255 {
-            fcsSize = 0 // 1-byte FCS (fcs_field_size = 0 + single_segment)
-            frame.append(0x20) // FHD: single_segment=1, fcs=00
+            frame.append(0x20)
             frame.append(UInt8(input.count))
         } else if input.count <= 65535 + 256 {
-            fcsSize = 1
-            frame.append(0x60) // FHD: single_segment=1, fcs=01
+            frame.append(0x60)
             let adjusted = UInt16(input.count - 256)
             withUnsafeBytes(of: adjusted.littleEndian) { frame.append(contentsOf: $0) }
         } else {
-            fcsSize = 2
-            frame.append(0xA0) // FHD: single_segment=1, fcs=10
+            frame.append(0xA0)
             withUnsafeBytes(of: UInt32(input.count).littleEndian) { frame.append(contentsOf: $0) }
         }
 
-        // For simplicity, emit as raw blocks (uncompressed within Zstd frame)
         var offset = 0
-        let maxBlockSize = 1 << 17 // 128 KB
+        let maxBlockSize = 1 << 17
 
         while offset < input.count {
             let remaining = input.count - offset
             let blockSize = min(remaining, maxBlockSize)
             let isLast = (offset + blockSize >= input.count)
 
-            // Block header: 3 bytes, last_block(1) | block_type(2) | block_size(21)
             var blockHeader = UInt32(blockSize) << 3
             blockHeader |= 0 << 1 // Raw block type
             if isLast { blockHeader |= 1 }
@@ -582,12 +864,32 @@ enum ZstdCompressor {
     }
 }
 
+// MARK: - Shared Baseline Tables (RFC 8878 Section 3.1.1.3)
+
+private let zstdLLBaselines = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 24, 28, 32, 40, 48, 64, 128, 256, 512,
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072
+]
+private let zstdLLExtraBits = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+]
+private let zstdMLBaselines = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+    16, 18, 20, 24, 28, 32, 40, 48, 64, 128, 256, 512,
+    1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072
+]
+private let zstdMLExtraBits = [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    1, 1, 1, 2, 2, 3, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17
+]
+
 // MARK: - Bit Readers
 
-private struct ByteReader {
+private struct ZstdByteReader {
     let data: Data
     var offset: Int = 0
-
     var remaining: Int { data.count - offset }
 
     init(data: Data) { self.data = data }
@@ -600,24 +902,16 @@ private struct ByteReader {
     }
 
     mutating func readUInt16LE() throws -> UInt16 {
-        let b0 = UInt16(try readByte())
-        let b1 = UInt16(try readByte())
-        return b0 | (b1 << 8)
+        UInt16(try readByte()) | (UInt16(try readByte()) << 8)
     }
 
     mutating func readUInt24LE() throws -> UInt32 {
-        let b0 = UInt32(try readByte())
-        let b1 = UInt32(try readByte())
-        let b2 = UInt32(try readByte())
-        return b0 | (b1 << 8) | (b2 << 16)
+        UInt32(try readByte()) | (UInt32(try readByte()) << 8) | (UInt32(try readByte()) << 16)
     }
 
     mutating func readUInt32LE() throws -> UInt32 {
-        let b0 = UInt32(try readByte())
-        let b1 = UInt32(try readByte())
-        let b2 = UInt32(try readByte())
-        let b3 = UInt32(try readByte())
-        return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+        UInt32(try readByte()) | (UInt32(try readByte()) << 8) |
+        (UInt32(try readByte()) << 16) | (UInt32(try readByte()) << 24)
     }
 
     mutating func readUInt64LE() throws -> UInt64 {
@@ -646,79 +940,114 @@ private struct ByteReader {
     }
 }
 
-private struct BitReader {
-    private var data: Data
-    private var offset: Int = 0
+/// Forward bit reader: reads bits LSB-first from byte stream
+private struct ZstdForwardBitReader {
+    private let data: Data
+    private var byteOffset: Int = 0
+    private var bitOffset: Int = 0 // 0..7 within current byte
 
-    var bitsRemaining: Int { (data.count - offset) * 8 }
+    var bitsAvailable: Int { (data.count - byteOffset) * 8 - bitOffset }
 
     init(data: Data) { self.data = data }
 
-    mutating func readByte() throws -> UInt8 {
-        guard offset < data.count else { throw ParquetError.unexpectedEOF }
-        let b = data[data.startIndex + offset]
-        offset += 1
+    mutating func readByteDirect() throws -> UInt8 {
+        guard bitOffset == 0 || true else { throw ParquetError.unexpectedEOF }
+        // Align first
+        if bitOffset != 0 {
+            byteOffset += 1
+            bitOffset = 0
+        }
+        guard byteOffset < data.count else { throw ParquetError.unexpectedEOF }
+        let b = data[data.startIndex + byteOffset]
+        byteOffset += 1
         return b
     }
 
-    mutating func readBits(_ n: Int) throws -> Int {
-        guard n <= 32 && n > 0 else { return 0 }
+    mutating func readBytesDirect(_ count: Int) throws -> Data {
+        if bitOffset != 0 {
+            byteOffset += 1
+            bitOffset = 0
+        }
+        guard byteOffset + count <= data.count else { throw ParquetError.unexpectedEOF }
+        let start = data.startIndex + byteOffset
+        byteOffset += count
+        return Data(data[start..<(start + count)])
+    }
+
+    mutating func readBitsForward(_ n: Int) throws -> Int {
+        guard n > 0 else { return 0 }
         var result = 0
         for i in 0..<n {
-            let byteIdx = offset / 8
-            let bitIdx = offset % 8
-            guard byteIdx < data.count else { return result }
-            let bit = (Int(data[data.startIndex + byteIdx]) >> bitIdx) & 1
+            let totalBit = byteOffset * 8 + bitOffset
+            guard totalBit < data.count * 8 else { return result }
+            let byte = data[data.startIndex + byteOffset]
+            let bit = (Int(byte) >> bitOffset) & 1
             result |= bit << i
-            offset += 1
+            bitOffset += 1
+            if bitOffset >= 8 {
+                bitOffset = 0
+                byteOffset += 1
+            }
         }
         return result
     }
 
-    mutating func readData(_ count: Int) throws -> Data {
-        // Align to byte boundary
-        let byteOffset = (offset + 7) / 8
-        guard byteOffset + count <= data.count else {
-            let available = data.count - byteOffset
-            let result = data[(data.startIndex + byteOffset)..<(data.startIndex + byteOffset + available)]
-            offset = data.count * 8
-            return Data(result)
+    mutating func alignToByte() {
+        if bitOffset != 0 {
+            byteOffset += 1
+            bitOffset = 0
         }
-        let result = data[(data.startIndex + byteOffset)..<(data.startIndex + byteOffset + count)]
-        offset = (byteOffset + count) * 8
-        return Data(result)
     }
 
-    mutating func readRemainingData() throws -> Data {
-        let byteOffset = (offset + 7) / 8
-        let result = data[(data.startIndex + byteOffset)...]
-        offset = data.count * 8
-        return Data(result)
+    func readRemainingBytes() -> Data {
+        let start = bitOffset != 0 ? byteOffset + 1 : byteOffset
+        guard start < data.count else { return Data() }
+        return Data(data[(data.startIndex + start)...])
     }
 }
 
-private struct ReverseBitReader {
+/// Reverse bit reader: reads bits MSB-first from end of byte stream
+private struct ZstdReverseBitReader {
     private let data: Data
-    private var bitPos: Int // counts down from total bits
+    private var bitPos: Int // current bit position (counts down)
 
-    var bitsRemaining: Int { bitPos }
+    var bitsAvailable: Int { bitPos }
 
     init(data: Data) {
         self.data = data
-        // Find last set bit to initialize
-        self.bitPos = data.count * 8
-        // Skip leading zeros from the end (find the sentinel bit)
-        if !data.isEmpty {
-            let lastByte = data[data.startIndex + data.count - 1]
-            if lastByte != 0 {
-                var mask = 7
-                while mask >= 0 && (lastByte >> mask) & 1 == 0 { mask -= 1 }
-                self.bitPos = (data.count - 1) * 8 + mask
-            }
+        // Find sentinel bit: highest set bit in last byte
+        self.bitPos = 0
+        guard !data.isEmpty else { return }
+        let lastByte = data[data.startIndex + data.count - 1]
+        guard lastByte != 0 else {
+            self.bitPos = (data.count - 1) * 8
+            return
         }
+        let highBit = 7 - lastByte.leadingZeroBitCount
+        self.bitPos = (data.count - 1) * 8 + highBit // skip sentinel bit itself
     }
 
-    mutating func readBits(_ n: Int) throws -> Int {
+    mutating func peekBits(_ n: Int) -> Int {
+        guard n > 0 else { return 0 }
+        var result = 0
+        for i in 0..<n {
+            let pos = bitPos - 1 - i
+            guard pos >= 0 else { break }
+            let byteIdx = pos / 8
+            let bitIdx = pos % 8
+            guard byteIdx < data.count else { break }
+            let bit = (Int(data[data.startIndex + byteIdx]) >> bitIdx) & 1
+            result |= bit << (n - 1 - i)
+        }
+        return result
+    }
+
+    mutating func consumeBits(_ n: Int) {
+        bitPos -= n
+        if bitPos < 0 { bitPos = 0 }
+    }
+
+    mutating func readBitsSafe(_ n: Int) -> Int {
         guard n > 0 else { return 0 }
         var result = 0
         for i in 0..<n {
@@ -726,13 +1055,10 @@ private struct ReverseBitReader {
             guard bitPos >= 0 else { return result }
             let byteIdx = bitPos / 8
             let bitIdx = bitPos % 8
+            guard byteIdx < data.count else { return result }
             let bit = (Int(data[data.startIndex + byteIdx]) >> bitIdx) & 1
             result |= bit << (n - 1 - i)
         }
         return result
     }
-}
-
-private extension Double {
-    func log2() -> Double { Foundation.log2(self) }
 }

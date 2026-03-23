@@ -7,11 +7,16 @@ import Foundation
 
 // MARK: - Write Options
 
+/// Closure that encrypts page data. Parameters: (pageData, pageOrdinal) → encryptedData.
+/// Captures the key and column/row-group ordinals from the encryption config.
+typealias PageEncryptor = (Data, Int16) throws -> Data
+
 struct ColumnWriteOptions {
     var compression: CompressionCodec = .uncompressed
     var useDictionary: Bool = false
     var enableStatistics: Bool = true
     var dataPageVersion: DataPageVersion = .v1
+    var pageEncryptor: PageEncryptor? = nil
 }
 
 // MARK: - Column Chunk Result
@@ -84,8 +89,17 @@ struct ColumnWriter<T: ParquetValue>: AnyColumnWriter {
             statistics = buildStatistics()
         }
 
-        let pageResult = buildPage(valueBytes: valueBytes, numValues: numValues,
+        var pageResult = buildPage(valueBytes: valueBytes, numValues: numValues,
                                     encoding: encoding, compression: options.compression)
+
+        if let encrypt = options.pageEncryptor,
+           let encrypted = try? encrypt(pageResult.bytes, 0) {
+            pageResult = PageBuildResult(
+                bytes: encrypted,
+                uncompressedTotal: pageResult.uncompressedTotal,
+                compressedTotal: encrypted.count
+            )
+        }
 
         let meta = ColumnMetaData(
             type: descriptor.physicalType,
@@ -283,12 +297,19 @@ struct ByteArrayColumnWriter: AnyColumnWriter {
             var dictEncoder = ByteArrayDictionaryEncoder()
             dictEncoder.encodeAll(values)
 
-            // Dictionary page
+            // Dictionary page (compressed with column codec)
             let dictData = dictEncoder.encodeDictionary()
+            var compressedDictData = dictData
+            if options.compression != .uncompressed {
+                if let codec = try? CompressionCodecs.codec(for: options.compression),
+                   let compressed = try? codec.compress(dictData) {
+                    compressedDictData = compressed
+                }
+            }
             let dictHeader = PageHeader(
                 type: .dictionaryPage,
                 uncompressedPageSize: Int32(dictData.count),
-                compressedPageSize: Int32(dictData.count),
+                compressedPageSize: Int32(compressedDictData.count),
                 dictionaryPageHeader: DictionaryPageHeader(
                     numValues: Int32(dictEncoder.dictionarySize),
                     encoding: .plainDictionary
@@ -297,10 +318,10 @@ struct ByteArrayColumnWriter: AnyColumnWriter {
             let dictHeaderBytes = ThriftCompactWriter.serialize(dictHeader)
             var dictPage = Data()
             dictPage.append(contentsOf: dictHeaderBytes)
-            dictPage.append(contentsOf: dictData)
+            dictPage.append(contentsOf: compressedDictData)
             dictPageOffset = startOffset
             pages.append(dictPage)
-            totalUncompressed += Int64(dictPage.count)
+            totalUncompressed += Int64(dictHeaderBytes.count + dictData.count)
             totalCompressed += Int64(dictPage.count)
             encodings.append(.plainDictionary)
 
@@ -329,6 +350,18 @@ struct ByteArrayColumnWriter: AnyColumnWriter {
             totalUncompressed += Int64(pageResult.uncompressedTotal)
             totalCompressed += Int64(pageResult.compressedTotal)
             encodings.append(.plain)
+        }
+
+        // Encrypt pages if encryption is configured
+        if let encrypt = options.pageEncryptor {
+            totalCompressed = 0
+            for i in 0..<pages.count {
+                let pageOrdinal = Int16(i)
+                if let encrypted = try? encrypt(pages[i], pageOrdinal) {
+                    pages[i] = encrypted
+                }
+                totalCompressed += Int64(pages[i].count)
+            }
         }
 
         // Statistics for strings

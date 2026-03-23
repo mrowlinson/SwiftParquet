@@ -90,28 +90,27 @@ struct ParquetAESGCM {
         aad: Data = Data()
     ) throws -> Data {
         guard ciphertext.count >= 4 else {
-            throw ParquetError.corruptedFile("encrypted module too short")
+            throw ParquetError.corruptedFile("encrypted module too short (\(ciphertext.count) bytes)")
         }
 
-        let start = ciphertext.startIndex
-        var nonceLen: UInt32 = 0
-        withUnsafeMutableBytes(of: &nonceLen) { ptr in
-            for i in 0..<4 { ptr[i] = ciphertext[start + i] }
-        }
-        nonceLen = UInt32(littleEndian: nonceLen)
 
-        let nonceStart = start + 4
-        let nonceEnd = nonceStart + Int(nonceLen)
-        guard nonceEnd + 16 <= ciphertext.endIndex else {
-            throw ParquetError.corruptedFile("encrypted module truncated")
+        let base = ciphertext.startIndex
+        let nonceLen = UInt32(ciphertext[base]) |
+                       (UInt32(ciphertext[base + 1]) << 8) |
+                       (UInt32(ciphertext[base + 2]) << 16) |
+                       (UInt32(ciphertext[base + 3]) << 24)
+
+        let nonceEnd = 4 + Int(nonceLen)
+        guard nonceEnd + 16 <= ciphertext.count else {
+            throw ParquetError.corruptedFile("encrypted module truncated (count=\(ciphertext.count), nonceLen=\(nonceLen), need=\(nonceEnd + 16))")
         }
 
-        let nonceData = ciphertext[nonceStart..<nonceEnd]
+        let nonceData = ciphertext[(base + 4)..<(base + nonceEnd)]
         let nonce = try AES.GCM.Nonce(data: nonceData)
 
         let tagStart = ciphertext.endIndex - 16
         let tag = ciphertext[tagStart..<ciphertext.endIndex]
-        let encryptedContent = ciphertext[nonceEnd..<tagStart]
+        let encryptedContent = ciphertext[(base + nonceEnd)..<tagStart]
 
         let sealedBox = try AES.GCM.SealedBox(nonce: nonce, ciphertext: encryptedContent, tag: tag)
         return try AES.GCM.open(sealedBox, using: key, authenticating: aad)
