@@ -32,7 +32,7 @@ struct PageReader {
     /// Returns the header and number of bytes consumed by the header.
     static func readPageHeader(from data: Data, at offset: Int) throws -> (header: PageHeader, headerSize: Int) {
         let slice = data[(data.startIndex + offset)...]
-        var reader = ThriftCompactReader(data: Data(slice))
+        var reader = ThriftCompactReader(data: slice)
         let header = try PageHeader.read(from: &reader)
         return (header, reader.bytesRead)
     }
@@ -91,8 +91,8 @@ struct PageReader {
             bodyOffset += consumed
         }
 
-        // Remaining bytes are the encoded values
-        let valueData = Data(pageBody[(pageBody.startIndex + bodyOffset)...])
+        // Remaining bytes are the encoded values (slice — shares backing storage)
+        let valueData = pageBody[(pageBody.startIndex + bodyOffset)...]
 
         return DecodedDataPage(
             numValues: dpHeader.numValues,
@@ -129,26 +129,26 @@ struct PageReader {
         let repLevelsByteLen = Int(v2Header.repetitionLevelsByteLength)
         let defLevelsByteLen = Int(v2Header.definitionLevelsByteLength)
 
-        // Rep levels (uncompressed, no 4-byte prefix)
+        // Rep levels (uncompressed, no 4-byte prefix) — pass slice directly
         var repLevels: [Int32]? = nil
         if repLevelsByteLen > 0 && maxRepLevel > 0 {
-            let repData = Data(data[bodyOffset..<(bodyOffset + repLevelsByteLen)])
+            let repData = data[bodyOffset..<(bodyOffset + repLevelsByteLen)]
             let bw = bitWidthForMaxLevel(maxRepLevel)
             repLevels = RLEDecoder(bitWidth: bw).decode(repData, expectedCount: Int(v2Header.numValues))
         }
         bodyOffset += repLevelsByteLen
 
-        // Def levels (uncompressed, no 4-byte prefix)
+        // Def levels (uncompressed, no 4-byte prefix) — pass slice directly
         var defLevels: [Int32]? = nil
         if defLevelsByteLen > 0 && maxDefLevel > 0 {
-            let defData = Data(data[bodyOffset..<(bodyOffset + defLevelsByteLen)])
+            let defData = data[bodyOffset..<(bodyOffset + defLevelsByteLen)]
             let bw = bitWidthForMaxLevel(maxDefLevel)
             defLevels = RLEDecoder(bitWidth: bw).decode(defData, expectedCount: Int(v2Header.numValues))
         }
         bodyOffset += defLevelsByteLen
 
-        // Values (compressed if isCompressed is true)
-        var valueData = Data(data[bodyOffset..<bodyEnd])
+        // Values (compressed if isCompressed is true) — copy only when decompression needed
+        var valueData = data[bodyOffset..<bodyEnd]
         if v2Header.isCompressed && codec != .uncompressed {
             let decompressor = try CompressionCodecs.codec(for: codec)
             let uncompressedValueSize = Int(header.uncompressedPageSize) - repLevelsByteLen - defLevelsByteLen

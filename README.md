@@ -15,10 +15,11 @@ A pure Swift implementation of the [Apache Parquet](https://parquet.apache.org/)
 | **Statistics** | Per-column min/max/null_count |
 | **Streaming** | Write large files with constant memory via `ParquetStreamWriter` |
 | **Async** | Parallel column reading with Swift concurrency |
+| **Performance** | Memory-mapped I/O, zero-copy slicing, `loadUnaligned` decoding, word-at-a-time bit unpacking, pre-allocated unsafe buffers |
 | **Platforms** | macOS 13+, iOS 16+, Linux (Swift 6.x) |
 | **Dependencies** | None on Apple platforms. [swift-crypto](https://github.com/apple/swift-crypto) on Linux only. |
 
-Validated against **pyarrow** and **DuckDB** on every test run (29 tests).
+Validated against **pyarrow** and **DuckDB** on every test run (38 tests).
 
 ## Installation
 
@@ -212,7 +213,7 @@ Sources/SwiftParquet/
 
 ```sh
 swift build
-swift test   # 29 tests — roundtrips, compression, nested types, pyarrow interop
+swift test   # 38 tests — roundtrips, compression, nested types, encryption, pyarrow interop
 ```
 
 ## License

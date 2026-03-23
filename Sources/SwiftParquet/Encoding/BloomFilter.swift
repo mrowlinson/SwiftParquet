@@ -43,21 +43,15 @@ public struct BloomFilter: Sendable {
         let blockOffset = blockIndex * 32
         let key = UInt32(truncatingIfNeeded: hash >> 32)
 
-        for i in 0..<8 {
-            let bitIndex = Int((key &* BloomFilter.salts[i]) >> 27) // top 5 bits → 0..31
-            let wordIndex = i * 4  // each salt targets one of 8 uint32s in the block
-            guard blockOffset + wordIndex + 3 < blocks.count else { continue }
-
-            let base = blocks.startIndex + blockOffset + wordIndex
-            var word = UInt32(blocks[base]) |
-                      (UInt32(blocks[base + 1]) << 8) |
-                      (UInt32(blocks[base + 2]) << 16) |
-                      (UInt32(blocks[base + 3]) << 24)
-            word |= (1 << bitIndex)
-            blocks[base] = UInt8(word & 0xFF)
-            blocks[base + 1] = UInt8((word >> 8) & 0xFF)
-            blocks[base + 2] = UInt8((word >> 16) & 0xFF)
-            blocks[base + 3] = UInt8((word >> 24) & 0xFF)
+        blocks.withUnsafeMutableBytes { buf in
+            for i in 0..<8 {
+                let bitIndex = Int((key &* BloomFilter.salts[i]) >> 27)
+                let wordOffset = blockOffset + i * 4
+                guard wordOffset + 4 <= buf.count else { continue }
+                var word = buf.loadUnaligned(fromByteOffset: wordOffset, as: UInt32.self)
+                word |= (1 << bitIndex)
+                buf.storeBytes(of: word, toByteOffset: wordOffset, as: UInt32.self)
+            }
         }
     }
 
@@ -67,19 +61,16 @@ public struct BloomFilter: Sendable {
         let blockOffset = blockIndex * 32
         let key = UInt32(truncatingIfNeeded: hash >> 32)
 
-        for i in 0..<8 {
-            let bitIndex = Int((key &* BloomFilter.salts[i]) >> 27)
-            let wordIndex = i * 4
-            guard blockOffset + wordIndex + 3 < blocks.count else { return false }
-
-            let base = blocks.startIndex + blockOffset + wordIndex
-            let word = UInt32(blocks[base]) |
-                      (UInt32(blocks[base + 1]) << 8) |
-                      (UInt32(blocks[base + 2]) << 16) |
-                      (UInt32(blocks[base + 3]) << 24)
-            if word & (1 << bitIndex) == 0 { return false }
+        return blocks.withUnsafeBytes { buf in
+            for i in 0..<8 {
+                let bitIndex = Int((key &* BloomFilter.salts[i]) >> 27)
+                let wordOffset = blockOffset + i * 4
+                guard wordOffset + 4 <= buf.count else { return false }
+                let word = buf.loadUnaligned(fromByteOffset: wordOffset, as: UInt32.self)
+                if word & (1 << bitIndex) == 0 { return false }
+            }
+            return true
         }
-        return true
     }
 
     /// Serialized filter data.
@@ -97,75 +88,83 @@ public struct BloomFilter: Sendable {
 
         let len = data.count
 
-        var h: UInt64
-
-        if len >= 32 {
-            var v1 = seed &+ prime1 &+ prime2
-            var v2 = seed &+ prime2
-            var v3 = seed
-            var v4 = seed &- prime1
-
-            var offset = 0
-            while offset + 32 <= len {
-                v1 = xxRound(v1, read64LE(data, offset))
-                v2 = xxRound(v2, read64LE(data, offset + 8))
-                v3 = xxRound(v3, read64LE(data, offset + 16))
-                v4 = xxRound(v4, read64LE(data, offset + 24))
-                offset += 32
+        // Hoist withUnsafeBytes to function level — eliminates per-read closure overhead
+        return data.withUnsafeBytes { buf in
+            @inline(__always) func rd64(_ off: Int) -> UInt64 {
+                UInt64(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt64.self))
+            }
+            @inline(__always) func rd32(_ off: Int) -> UInt32 {
+                UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt32.self))
             }
 
-            h = rotl(v1, 1) &+ rotl(v2, 7) &+ rotl(v3, 12) &+ rotl(v4, 18)
-            h = mergeRound(h, v1)
-            h = mergeRound(h, v2)
-            h = mergeRound(h, v3)
-            h = mergeRound(h, v4)
+            var h: UInt64
 
-            // Process remaining from offset
-            while offset + 8 <= len {
-                h ^= xxRound(0, read64LE(data, offset))
-                h = rotl(h, 27) &* prime1 &+ prime4
-                offset += 8
+            if len >= 32 {
+                var v1 = seed &+ prime1 &+ prime2
+                var v2 = seed &+ prime2
+                var v3 = seed
+                var v4 = seed &- prime1
+
+                var offset = 0
+                while offset + 32 <= len {
+                    v1 = xxRound(v1, rd64(offset))
+                    v2 = xxRound(v2, rd64(offset + 8))
+                    v3 = xxRound(v3, rd64(offset + 16))
+                    v4 = xxRound(v4, rd64(offset + 24))
+                    offset += 32
+                }
+
+                h = rotl(v1, 1) &+ rotl(v2, 7) &+ rotl(v3, 12) &+ rotl(v4, 18)
+                h = mergeRound(h, v1)
+                h = mergeRound(h, v2)
+                h = mergeRound(h, v3)
+                h = mergeRound(h, v4)
+
+                while offset + 8 <= len {
+                    h ^= xxRound(0, rd64(offset))
+                    h = rotl(h, 27) &* prime1 &+ prime4
+                    offset += 8
+                }
+                while offset + 4 <= len {
+                    h ^= UInt64(rd32(offset)) &* prime1
+                    h = rotl(h, 23) &* prime2 &+ prime3
+                    offset += 4
+                }
+                while offset < len {
+                    h ^= UInt64(buf[offset]) &* prime5
+                    h = rotl(h, 11) &* prime1
+                    offset += 1
+                }
+            } else {
+                h = seed &+ prime5
+                var offset = 0
+                while offset + 8 <= len {
+                    h ^= xxRound(0, rd64(offset))
+                    h = rotl(h, 27) &* prime1 &+ prime4
+                    offset += 8
+                }
+                while offset + 4 <= len {
+                    h ^= UInt64(rd32(offset)) &* prime1
+                    h = rotl(h, 23) &* prime2 &+ prime3
+                    offset += 4
+                }
+                while offset < len {
+                    h ^= UInt64(buf[offset]) &* prime5
+                    h = rotl(h, 11) &* prime1
+                    offset += 1
+                }
             }
-            while offset + 4 <= len {
-                h ^= UInt64(read32LE(data, offset)) &* prime1
-                h = rotl(h, 23) &* prime2 &+ prime3
-                offset += 4
-            }
-            while offset < len {
-                h ^= UInt64(data[data.startIndex + offset]) &* prime5
-                h = rotl(h, 11) &* prime1
-                offset += 1
-            }
-        } else {
-            h = seed &+ prime5
-            var offset = 0
-            while offset + 8 <= len {
-                h ^= xxRound(0, read64LE(data, offset))
-                h = rotl(h, 27) &* prime1 &+ prime4
-                offset += 8
-            }
-            while offset + 4 <= len {
-                h ^= UInt64(read32LE(data, offset)) &* prime1
-                h = rotl(h, 23) &* prime2 &+ prime3
-                offset += 4
-            }
-            while offset < len {
-                h ^= UInt64(data[data.startIndex + offset]) &* prime5
-                h = rotl(h, 11) &* prime1
-                offset += 1
-            }
+
+            h &+= UInt64(len)
+
+            h ^= h >> 33
+            h &*= prime2
+            h ^= h >> 29
+            h &*= prime3
+            h ^= h >> 32
+
+            return h
         }
-
-        h &+= UInt64(len)
-
-        // Final avalanche
-        h ^= h >> 33
-        h &*= prime2
-        h ^= h >> 29
-        h &*= prime3
-        h ^= h >> 32
-
-        return h
     }
 
     /// Hash a string for bloom filter insertion/lookup.
@@ -220,17 +219,4 @@ public struct BloomFilter: Sendable {
         (v << n) | (v >> (64 - n))
     }
 
-    private static func read64LE(_ data: Data, _ offset: Int) -> UInt64 {
-        let s = data.startIndex + offset
-        return UInt64(data[s]) | (UInt64(data[s+1]) << 8) |
-               (UInt64(data[s+2]) << 16) | (UInt64(data[s+3]) << 24) |
-               (UInt64(data[s+4]) << 32) | (UInt64(data[s+5]) << 40) |
-               (UInt64(data[s+6]) << 48) | (UInt64(data[s+7]) << 56)
-    }
-
-    private static func read32LE(_ data: Data, _ offset: Int) -> UInt32 {
-        let s = data.startIndex + offset
-        return UInt32(data[s]) | (UInt32(data[s+1]) << 8) |
-               (UInt32(data[s+2]) << 16) | (UInt32(data[s+3]) << 24)
-    }
 }

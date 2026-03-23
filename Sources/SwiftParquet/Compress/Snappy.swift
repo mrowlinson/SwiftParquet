@@ -27,105 +27,130 @@ struct SnappyCodec: CompressionCodecProtocol {
 enum SnappyDecompressor {
 
     static func decompress(_ data: Data) throws -> Data {
-        var offset = 0
+        try data.withUnsafeBytes { src in
+            var ip = 0  // input position
 
-        func readByte() throws -> UInt8 {
-            guard offset < data.count else { throw ParquetError.corruptedFile("snappy: unexpected EOF") }
-            let b = data[data.startIndex + offset]
-            offset += 1
-            return b
-        }
-
-        func readUVarint() throws -> Int {
-            var result = 0
-            var shift = 0
-            while true {
-                let b = try readByte()
-                result |= Int(b & 0x7F) << shift
-                if b & 0x80 == 0 { break }
-                shift += 7
-                guard shift < 64 else { throw ParquetError.corruptedFile("snappy: varint overflow") }
+            func readByte() throws -> UInt8 {
+                guard ip < src.count else { throw ParquetError.corruptedFile("snappy: unexpected EOF") }
+                let b = src[ip]
+                ip += 1
+                return b
             }
-            return result
-        }
 
-        let uncompressedLength = try readUVarint()
-        var output = Data(capacity: uncompressedLength)
+            func readUVarint() throws -> Int {
+                var result = 0
+                var shift = 0
+                while true {
+                    let b = try readByte()
+                    result |= Int(b & 0x7F) << shift
+                    if b & 0x80 == 0 { break }
+                    shift += 7
+                    guard shift < 64 else { throw ParquetError.corruptedFile("snappy: varint overflow") }
+                }
+                return result
+            }
 
-        while offset < data.count {
-            let tag = try readByte()
-            let elementType = tag & 0x03
+            let uncompressedLength = try readUVarint()
+            // Pre-allocate the entire output buffer
+            var output = Data(count: uncompressedLength)
+            var wp = 0  // write position
 
-            switch elementType {
-            case 0x00: // Literal
-                var length: Int
-                let lenField = Int(tag >> 2)
-                if lenField < 60 {
-                    length = lenField + 1
-                } else {
-                    let extraBytes = lenField - 59
-                    length = 0
-                    for i in 0..<extraBytes {
-                        length |= Int(try readByte()) << (i * 8)
+            try output.withUnsafeMutableBytes { dst in
+                let out = dst.baseAddress!.assumingMemoryBound(to: UInt8.self)
+
+                while ip < src.count {
+                    let tag = try readByte()
+                    let elementType = tag & 0x03
+
+                    switch elementType {
+                    case 0x00: // Literal
+                        var length: Int
+                        let lenField = Int(tag >> 2)
+                        if lenField < 60 {
+                            length = lenField + 1
+                        } else {
+                            let extraBytes = lenField - 59
+                            length = 0
+                            for i in 0..<extraBytes {
+                                length |= Int(try readByte()) << (i * 8)
+                            }
+                            length += 1
+                        }
+                        guard ip + length <= src.count else {
+                            throw ParquetError.corruptedFile("snappy: literal overflows input")
+                        }
+                        guard wp + length <= uncompressedLength else {
+                            throw ParquetError.corruptedFile("snappy: output overflows")
+                        }
+                        // memcpy from input to output
+                        (out + wp).update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self) + ip, count: length)
+                        ip += length
+                        wp += length
+
+                    case 0x01: // Copy with 1-byte offset
+                        let length = 4 + Int((tag >> 2) & 0x07)
+                        let offsetHigh = Int(tag >> 5) & 0x07
+                        let offsetLow = Int(try readByte())
+                        let copyOffset = (offsetHigh << 8) | offsetLow
+                        guard copyOffset > 0 && copyOffset <= wp else {
+                            throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
+                        }
+                        try copyBytes(out: out, wp: &wp, limit: uncompressedLength, offset: copyOffset, length: length)
+
+                    case 0x02: // Copy with 2-byte offset
+                        let length = 1 + Int(tag >> 2)
+                        let b0 = Int(try readByte())
+                        let b1 = Int(try readByte())
+                        let copyOffset = b0 | (b1 << 8)
+                        guard copyOffset > 0 && copyOffset <= wp else {
+                            throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
+                        }
+                        try copyBytes(out: out, wp: &wp, limit: uncompressedLength, offset: copyOffset, length: length)
+
+                    case 0x03: // Copy with 4-byte offset
+                        let length = 1 + Int(tag >> 2)
+                        var copyOffset = 0
+                        for i in 0..<4 {
+                            copyOffset |= Int(try readByte()) << (i * 8)
+                        }
+                        guard copyOffset > 0 && copyOffset <= wp else {
+                            throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
+                        }
+                        try copyBytes(out: out, wp: &wp, limit: uncompressedLength, offset: copyOffset, length: length)
+
+                    default:
+                        throw ParquetError.corruptedFile("snappy: invalid tag type")
                     }
-                    length += 1
                 }
-                guard offset + length <= data.count else {
-                    throw ParquetError.corruptedFile("snappy: literal overflows input")
-                }
-                let start = data.startIndex + offset
-                output.append(data[start..<(start + length)])
-                offset += length
-
-            case 0x01: // Copy with 1-byte offset (length 4..11, offset 0..2047)
-                let length = 4 + Int((tag >> 2) & 0x07)
-                let offsetHigh = Int(tag >> 5) & 0x07
-                let offsetLow = Int(try readByte())
-                let copyOffset = (offsetHigh << 8) | offsetLow
-                guard copyOffset > 0 && copyOffset <= output.count else {
-                    throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
-                }
-                try appendCopy(to: &output, offset: copyOffset, length: length)
-
-            case 0x02: // Copy with 2-byte offset (length 1..64, offset 0..65535)
-                let length = 1 + Int(tag >> 2)
-                let b0 = Int(try readByte())
-                let b1 = Int(try readByte())
-                let copyOffset = b0 | (b1 << 8)
-                guard copyOffset > 0 && copyOffset <= output.count else {
-                    throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
-                }
-                try appendCopy(to: &output, offset: copyOffset, length: length)
-
-            case 0x03: // Copy with 4-byte offset (length 1..64, offset 0..2^31-1)
-                let length = 1 + Int(tag >> 2)
-                var copyOffset = 0
-                for i in 0..<4 {
-                    copyOffset |= Int(try readByte()) << (i * 8)
-                }
-                guard copyOffset > 0 && copyOffset <= output.count else {
-                    throw ParquetError.corruptedFile("snappy: invalid copy offset \(copyOffset)")
-                }
-                try appendCopy(to: &output, offset: copyOffset, length: length)
-
-            default:
-                throw ParquetError.corruptedFile("snappy: invalid tag type")
             }
-        }
 
-        guard output.count == uncompressedLength else {
-            throw ParquetError.corruptedFile(
-                "snappy: expected \(uncompressedLength) bytes, got \(output.count)")
+            guard wp == uncompressedLength else {
+                throw ParquetError.corruptedFile(
+                    "snappy: expected \(uncompressedLength) bytes, got \(wp)")
+            }
+            return output
         }
-        return output
     }
 
-    private static func appendCopy(to output: inout Data, offset: Int, length: Int) throws {
-        let srcStart = output.count - offset
-        // Must copy byte-by-byte because source and dest can overlap
-        for i in 0..<length {
-            output.append(output[output.startIndex + srcStart + (i % offset)])
+    /// Copy bytes within the output buffer. Handles overlapping copies.
+    private static func copyBytes(
+        out: UnsafeMutablePointer<UInt8>, wp: inout Int,
+        limit: Int, offset: Int, length: Int
+    ) throws {
+        guard wp + length <= limit else {
+            throw ParquetError.corruptedFile("snappy: copy overflows output")
         }
+        let srcStart = wp - offset
+        if offset >= length {
+            // Non-overlapping: use memcpy
+            (out + wp).update(from: out + srcStart, count: length)
+        } else {
+            // Overlapping: byte-by-byte with cyclic repeat (no bounds checks)
+            for i in 0..<length {
+                out[wp + i] = out[srcStart + (i % offset)]
+            }
+        }
+        wp += length
     }
 }
 

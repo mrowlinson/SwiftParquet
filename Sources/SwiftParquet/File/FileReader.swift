@@ -61,28 +61,28 @@ public struct ParquetFileReaderCore {
             guard footerMagic == parquetMagicBytes else { throw ParquetError.invalidMagicBytes }
         }
 
-        var footerLength: UInt32 = 0
         let footerLenStart = data.endIndex - 8
-        withUnsafeMutableBytes(of: &footerLength) { ptr in
-            for i in 0..<4 { ptr[i] = data[footerLenStart + i] }
+        let footerLength = data.withUnsafeBytes { buf in
+            UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: footerLenStart - data.startIndex, as: UInt32.self))
         }
-        footerLength = UInt32(littleEndian: footerLength)
 
         guard Int(footerLength) + 8 <= data.count else {
             throw ParquetError.corruptedFile("footer length \(footerLength) exceeds file size")
         }
 
         let metadataStart = data.endIndex - 8 - Int(footerLength)
-        var metadataData = Data(data[metadataStart..<(metadataStart + Int(footerLength))])
+        let metadataSlice = data[metadataStart..<(metadataStart + Int(footerLength))]
 
-        // Decrypt footer if PARE magic
+        // Decrypt footer if PARE magic, otherwise pass slice directly (no copy)
+        let metadataData: Data
         if isEncryptedFooter {
-
             guard let enc = encryption, let footerKey = enc.footerKey else {
                 throw ParquetError.corruptedFile("encrypted footer requires encryption key")
             }
             let aad = ParquetAESGCM.buildAAD(moduleType: .footer)
-            metadataData = try ParquetAESGCM.decrypt(metadataData, key: footerKey, aad: aad)
+            metadataData = try ParquetAESGCM.decrypt(Data(metadataSlice), key: footerKey, aad: aad)
+        } else {
+            metadataData = metadataSlice
         }
 
         var reader = ThriftCompactReader(data: metadataData)
@@ -99,7 +99,7 @@ public struct ParquetFileReaderCore {
     /// Initialize from a file path.
     public init(path: String, encryption: ParquetEncryptionConfig? = nil) throws {
         let url = URL(fileURLWithPath: path)
-        let fileData = try Data(contentsOf: url)
+        let fileData = try Data(contentsOf: url, options: .mappedIfSafe)
         try self.init(data: fileData, encryption: encryption)
     }
 

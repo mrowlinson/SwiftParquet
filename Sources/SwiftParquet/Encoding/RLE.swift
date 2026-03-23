@@ -76,16 +76,11 @@ struct RLEEncoder {
                 let numGroups = (literalCount + 7) / 8
                 let paddedCount = numGroups * 8
 
-                var literalValues = Array(values[literalStart..<(literalStart + literalCount)])
-                while literalValues.count < paddedCount {
-                    literalValues.append(0)
-                }
-
                 // Header: (numGroups << 1) | 1
                 appendVarint((UInt64(numGroups) << 1) | 1, to: &output)
 
-                // Bit-pack the values
-                let packed = bitPack(literalValues, bitWidth: bitWidth)
+                // Bit-pack directly from source array, treating out-of-bounds as 0
+                let packed = bitPackSlice(values, start: literalStart, count: paddedCount, bitWidth: bitWidth)
                 output.append(contentsOf: packed)
             }
         }
@@ -125,21 +120,30 @@ struct RLEEncoder {
         }
     }
 
-    /// Bit-pack an array of values (LSB-first within each byte).
-    private func bitPack(_ values: [Int32], bitWidth: Int) -> Data {
-        let totalBits = values.count * bitWidth
+    /// Bit-pack values from a slice of the source array (LSB-first within each byte).
+    /// Uses shift-and-OR per value instead of bit-by-bit inner loop.
+    private func bitPackSlice(_ values: [Int32], start: Int, count: Int, bitWidth: Int) -> Data {
+        let totalBits = count * bitWidth
         let byteCount = (totalBits + 7) / 8
         var result = Data(count: byteCount)
 
-        var bitPos = 0
-        for value in values {
-            var v = UInt64(UInt32(bitPattern: value))
-            for _ in 0..<bitWidth {
-                let byteIdx = bitPos / 8
-                let bitIdx = bitPos % 8
-                result[result.startIndex + byteIdx] |= UInt8((v & 1) << bitIdx)
-                v >>= 1
-                bitPos += 1
+        result.withUnsafeMutableBytes { buf in
+            let ptr = buf.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            var bitPos = 0
+            for i in 0..<count {
+                let idx = start + i
+                let v = idx < values.count ? UInt64(UInt32(bitPattern: values[idx])) : 0
+                // Shift-and-OR: write the value's bits starting at bitPos
+                let byteOff = bitPos >> 3
+                let bitOff = bitPos & 7
+                var shifted = v << bitOff
+                var b = byteOff
+                while shifted != 0 && b < byteCount {
+                    ptr[b] |= UInt8(shifted & 0xFF)
+                    shifted >>= 8
+                    b += 1
+                }
+                bitPos += bitWidth
             }
         }
 
@@ -158,6 +162,7 @@ struct RLEDecoder {
     }
 
     /// Decode values from RLE-encoded bytes (WITHOUT length prefix).
+    /// Data may be a slice with non-zero startIndex.
     func decode(_ data: Data, expectedCount: Int) -> [Int32] {
         guard bitWidth > 0 && !data.isEmpty else {
             return [Int32](repeating: 0, count: expectedCount)
@@ -165,85 +170,92 @@ struct RLEDecoder {
 
         var result = [Int32]()
         result.reserveCapacity(expectedCount)
-        var offset = 0
+        let mask: UInt64 = bitWidth < 64 ? (UInt64(1) << bitWidth) - 1 : UInt64.max
 
-        while offset < data.count && result.count < expectedCount {
-            // Read varint header
-            var header: UInt64 = 0
-            var shift: UInt64 = 0
-            while offset < data.count {
-                let b = data[data.startIndex + offset]
-                offset += 1
-                header |= UInt64(b & 0x7F) << shift
-                if b & 0x80 == 0 { break }
-                shift += 7
-            }
+        data.withUnsafeBytes { buf in
+            var offset = 0
 
-            if header & 1 == 1 {
-                // Literal run: (numGroups << 1) | 1
-                let numGroups = Int(header >> 1)
-                let numValues = numGroups * 8
-                let totalBits = numValues * bitWidth
-                let byteCount = (totalBits + 7) / 8
+            while offset < buf.count && result.count < expectedCount {
+                // Read varint header
+                var header: UInt64 = 0
+                var shift: UInt64 = 0
+                while offset < buf.count {
+                    let b = buf[offset]
+                    offset += 1
+                    header |= UInt64(b & 0x7F) << shift
+                    if b & 0x80 == 0 { break }
+                    shift += 7
+                }
 
-                guard offset + byteCount <= data.count else { break }
-                let start = data.startIndex + offset
+                if header & 1 == 1 {
+                    // Literal run: (numGroups << 1) | 1
+                    let numGroups = Int(header >> 1)
+                    let numValues = numGroups * 8
+                    let totalBits = numValues * bitWidth
+                    let byteCount = (totalBits + 7) / 8
 
-                var bitPos = 0
-                for _ in 0..<numValues {
-                    guard result.count < expectedCount else { break }
-                    var value: UInt32 = 0
-                    for bit in 0..<bitWidth {
-                        let byteIdx = bitPos / 8
-                        let bitIdx = bitPos % 8
-                        if byteIdx < byteCount {
-                            if (data[start + byteIdx] >> bitIdx) & 1 != 0 {
-                                value |= UInt32(1) << bit
+                    guard offset + byteCount <= buf.count else { return }
+
+                    // Word-at-a-time bit unpacking
+                    var bitPos = 0
+                    for _ in 0..<numValues {
+                        guard result.count < expectedCount else { break }
+                        let byteOff = offset + (bitPos >> 3)
+                        let bitOff = bitPos & 7
+
+                        var word: UInt64 = 0
+                        if byteOff + 8 <= buf.count {
+                            word = buf.loadUnaligned(fromByteOffset: byteOff, as: UInt64.self)
+                        } else {
+                            // Fallback for last partial word near end of buffer
+                            for b in 0..<min(8, buf.count - byteOff) {
+                                word |= UInt64(buf[byteOff + b]) << (b * 8)
                             }
                         }
-                        bitPos += 1
+                        let value = UInt32((word >> bitOff) & mask)
+                        result.append(Int32(bitPattern: value))
+                        bitPos += bitWidth
                     }
-                    result.append(Int32(bitPattern: value))
-                }
-                offset += byteCount
-            } else {
-                // RLE run: (count << 1)
-                let count = Int(header >> 1)
-                let valueByteCount = (bitWidth + 7) / 8
-                guard offset + valueByteCount <= data.count else { break }
+                    offset += byteCount
+                } else {
+                    // RLE run: (count << 1)
+                    let count = Int(header >> 1)
+                    let valueByteCount = (bitWidth + 7) / 8
+                    guard offset + valueByteCount <= buf.count else { return }
 
-                var value: UInt64 = 0
-                for i in 0..<valueByteCount {
-                    value |= UInt64(data[data.startIndex + offset + i]) << (i * 8)
-                }
-                offset += valueByteCount
+                    var value: UInt64 = 0
+                    for i in 0..<valueByteCount {
+                        value |= UInt64(buf[offset + i]) << (i * 8)
+                    }
+                    offset += valueByteCount
 
-                let val = Int32(bitPattern: UInt32(value & 0xFFFF_FFFF))
-                for _ in 0..<min(count, expectedCount - result.count) {
-                    result.append(val)
+                    let val = Int32(bitPattern: UInt32(value & 0xFFFF_FFFF))
+                    let n = min(count, expectedCount - result.count)
+                    result.append(contentsOf: repeatElement(val, count: n))
                 }
             }
         }
 
         // Pad if we didn't get enough
-        while result.count < expectedCount { result.append(0) }
+        if result.count < expectedCount {
+            result.append(contentsOf: repeatElement(Int32(0), count: expectedCount - result.count))
+        }
 
         return Array(result.prefix(expectedCount))
     }
 
     /// Decode from data WITH the 4-byte LE length prefix.
+    /// Data may be a slice with non-zero startIndex.
     func decodeWithLengthPrefix(_ data: Data, at offset: Int, expectedCount: Int) -> (values: [Int32], bytesConsumed: Int) {
         guard offset + 4 <= data.count else {
             return ([Int32](repeating: 0, count: expectedCount), 0)
         }
         let start = data.startIndex + offset
-        var len: UInt32 = 0
-        withUnsafeMutableBytes(of: &len) { ptr in
-            for i in 0..<4 { ptr[i] = data[start + i] }
+        let len = data.withUnsafeBytes { buf in
+            UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: offset, as: UInt32.self))
         }
-        len = UInt32(littleEndian: len)
         let rleData = data[(start + 4)..<(start + 4 + Int(len))]
-        let values = decode(Data(rleData), expectedCount: expectedCount)
+        let values = decode(rleData, expectedCount: expectedCount)
         return (values, 4 + Int(len))
     }
 }

@@ -172,25 +172,21 @@ struct DictionaryDecoder {
             return [Int32](repeating: 0, count: numValues)
         }
         let rleData = data[(data.startIndex + 1)...]
-        return RLEDecoder(bitWidth: bitWidth).decode(Data(rleData), expectedCount: numValues)
+        return RLEDecoder(bitWidth: bitWidth).decode(rleData, expectedCount: numValues)
     }
 
     private func decodeDictionaryByteArrays() throws -> [ByteArray] {
         var values = [ByteArray]()
-        var offset = 0
-        while offset < dictionaryData.count {
-            guard offset + 4 <= dictionaryData.count else { break }
-            let start = dictionaryData.startIndex + offset
-            var len: UInt32 = 0
-            withUnsafeMutableBytes(of: &len) { ptr in
-                for i in 0..<4 { ptr[i] = dictionaryData[start + i] }
+        let si = dictionaryData.startIndex
+        dictionaryData.withUnsafeBytes { buf in
+            var offset = 0
+            while offset + 4 <= buf.count {
+                let len = Int(UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: offset, as: UInt32.self)))
+                offset += 4
+                guard offset + len <= buf.count else { break }
+                values.append(ByteArray(Data(dictionaryData[(si + offset)..<(si + offset + len)])))
+                offset += len
             }
-            len = UInt32(littleEndian: len)
-            offset += 4
-            guard offset + Int(len) <= dictionaryData.count else { break }
-            let dataStart = dictionaryData.startIndex + offset
-            values.append(ByteArray(Data(dictionaryData[dataStart..<(dataStart + Int(len))])))
-            offset += Int(len)
         }
         return values
     }
@@ -229,40 +225,32 @@ protocol FixedWidthParquetValue: ParquetValue {
 
 extension Int32: FixedWidthParquetValue {
     static func decodePlain(from data: Data, at offset: Data.Index) -> Int32 {
-        var v: Int32 = 0
-        withUnsafeMutableBytes(of: &v) { ptr in
-            for i in 0..<4 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            Int32(littleEndian: buf.loadUnaligned(fromByteOffset: offset - data.startIndex, as: Int32.self))
         }
-        return Int32(littleEndian: v)
     }
 }
 
 extension Int64: FixedWidthParquetValue {
     static func decodePlain(from data: Data, at offset: Data.Index) -> Int64 {
-        var v: Int64 = 0
-        withUnsafeMutableBytes(of: &v) { ptr in
-            for i in 0..<8 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            Int64(littleEndian: buf.loadUnaligned(fromByteOffset: offset - data.startIndex, as: Int64.self))
         }
-        return Int64(littleEndian: v)
     }
 }
 
 extension Float: FixedWidthParquetValue {
     static func decodePlain(from data: Data, at offset: Data.Index) -> Float {
-        var bits: UInt32 = 0
-        withUnsafeMutableBytes(of: &bits) { ptr in
-            for i in 0..<4 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            Float(bitPattern: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: offset - data.startIndex, as: UInt32.self)))
         }
-        return Float(bitPattern: UInt32(littleEndian: bits))
     }
 }
 
 extension Double: FixedWidthParquetValue {
     static func decodePlain(from data: Data, at offset: Data.Index) -> Double {
-        var bits: UInt64 = 0
-        withUnsafeMutableBytes(of: &bits) { ptr in
-            for i in 0..<8 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            Double(bitPattern: UInt64(littleEndian: buf.loadUnaligned(fromByteOffset: offset - data.startIndex, as: UInt64.self)))
         }
-        return Double(bitPattern: UInt64(littleEndian: bits))
     }
 }

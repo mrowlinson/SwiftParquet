@@ -71,25 +71,29 @@ struct DeltaBinaryPackedEncoder {
             }
             output.append(contentsOf: bitWidths)
 
-            // Bit-pack each miniblock
+            // Bit-pack each miniblock using shift-and-OR per value
             for mb in 0..<miniblockCount {
                 let mbStart = mb * miniblockSize
                 let bw = Int(bitWidths[mb])
                 if bw == 0 { continue }
-                var bitBuf = Data()
-                var bitPos = 0
                 let totalBits = miniblockSize * bw
                 let byteCount = (totalBits + 7) / 8
-                bitBuf = Data(count: byteCount)
-                for i in 0..<miniblockSize {
-                    let val = mbStart + i < adjusted.count ? UInt64(adjusted[mbStart + i]) : 0
-                    for bit in 0..<bw {
-                        let byteIdx = bitPos / 8
-                        let bitIdx = bitPos % 8
-                        if (val >> bit) & 1 != 0 {
-                            bitBuf[bitBuf.startIndex + byteIdx] |= UInt8(1 << bitIdx)
+                var bitBuf = Data(count: byteCount)
+                bitBuf.withUnsafeMutableBytes { buf in
+                    let ptr = buf.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    var bitPos = 0
+                    for i in 0..<miniblockSize {
+                        let val = mbStart + i < adjusted.count ? UInt64(adjusted[mbStart + i]) : 0
+                        let byteOff = bitPos >> 3
+                        let bitOff = bitPos & 7
+                        var shifted = val << bitOff
+                        var b = byteOff
+                        while shifted != 0 && b < byteCount {
+                            ptr[b] |= UInt8(shifted & 0xFF)
+                            shifted >>= 8
+                            b += 1
                         }
-                        bitPos += 1
+                        bitPos += bw
                     }
                 }
                 output.append(bitBuf)
@@ -181,24 +185,30 @@ struct DeltaBinaryPackedDecoder {
                         values.append(lastValue)
                     }
                 } else {
-                    var bitPos = offset * 8
-                    for _ in 0..<miniblockSize {
-                        guard values.count < totalCount else { break }
-                        var val: UInt64 = 0
-                        for bit in 0..<bw {
-                            let byteIdx = bitPos / 8
-                            let bitIdx = bitPos % 8
-                            guard byteIdx < data.count else { break }
-                            if (data[data.startIndex + byteIdx] >> bitIdx) & 1 != 0 {
-                                val |= UInt64(1) << bit
+                    let mask: UInt64 = bw < 64 ? (UInt64(1) << bw) - 1 : UInt64.max
+                    data.withUnsafeBytes { buf in
+                        var bitPos = 0
+                        let baseOffset = offset
+                        for _ in 0..<miniblockSize {
+                            guard values.count < totalCount else { break }
+                            let byteOff = baseOffset + (bitPos >> 3)
+                            let bitOff = bitPos & 7
+                            var word: UInt64 = 0
+                            if byteOff + 8 <= buf.count {
+                                word = buf.loadUnaligned(fromByteOffset: byteOff, as: UInt64.self)
+                            } else {
+                                for b in 0..<min(8, buf.count - byteOff) {
+                                    word |= UInt64(buf[byteOff + b]) << (b * 8)
+                                }
                             }
-                            bitPos += 1
+                            let val = (word >> bitOff) & mask
+                            let delta = Int64(val) + minDelta
+                            lastValue = lastValue + delta
+                            values.append(lastValue)
+                            bitPos += bw
                         }
-                        let delta = Int64(val) + minDelta
-                        lastValue = lastValue + delta
-                        values.append(lastValue)
+                        offset = baseOffset + (bitPos + 7) / 8
                     }
-                    offset = (bitPos + 7) / 8
                 }
             }
         }

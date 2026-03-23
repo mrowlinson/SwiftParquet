@@ -129,97 +129,89 @@ public struct FixedLenByteArray: ParquetValue, Sendable {
 struct PlainDecoder {
 
     static func decodeInt32s(_ data: Data, count: Int) -> [Int32] {
-        var result = [Int32]()
-        result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 4 <= data.endIndex else { break }
-            var v: Int32 = 0
-            withUnsafeMutableBytes(of: &v) { ptr in
-                for i in 0..<4 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            var result = [Int32]()
+            result.reserveCapacity(count)
+            var off = 0
+            for _ in 0..<count {
+                guard off + 4 <= buf.count else { break }
+                result.append(Int32(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: Int32.self)))
+                off += 4
             }
-            result.append(Int32(littleEndian: v))
-            offset += 4
+            return result
         }
-        return result
     }
 
     static func decodeInt64s(_ data: Data, count: Int) -> [Int64] {
-        var result = [Int64]()
-        result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 8 <= data.endIndex else { break }
-            var v: Int64 = 0
-            withUnsafeMutableBytes(of: &v) { ptr in
-                for i in 0..<8 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            var result = [Int64]()
+            result.reserveCapacity(count)
+            var off = 0
+            for _ in 0..<count {
+                guard off + 8 <= buf.count else { break }
+                result.append(Int64(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: Int64.self)))
+                off += 8
             }
-            result.append(Int64(littleEndian: v))
-            offset += 8
+            return result
         }
-        return result
     }
 
     static func decodeFloats(_ data: Data, count: Int) -> [Float] {
-        var result = [Float]()
-        result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 4 <= data.endIndex else { break }
-            var bits: UInt32 = 0
-            withUnsafeMutableBytes(of: &bits) { ptr in
-                for i in 0..<4 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            var result = [Float]()
+            result.reserveCapacity(count)
+            var off = 0
+            for _ in 0..<count {
+                guard off + 4 <= buf.count else { break }
+                result.append(Float(bitPattern: UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt32.self))))
+                off += 4
             }
-            result.append(Float(bitPattern: UInt32(littleEndian: bits)))
-            offset += 4
+            return result
         }
-        return result
     }
 
     static func decodeDoubles(_ data: Data, count: Int) -> [Double] {
-        var result = [Double]()
-        result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 8 <= data.endIndex else { break }
-            var bits: UInt64 = 0
-            withUnsafeMutableBytes(of: &bits) { ptr in
-                for i in 0..<8 { ptr[i] = data[offset + i] }
+        data.withUnsafeBytes { buf in
+            var result = [Double]()
+            result.reserveCapacity(count)
+            var off = 0
+            for _ in 0..<count {
+                guard off + 8 <= buf.count else { break }
+                result.append(Double(bitPattern: UInt64(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt64.self))))
+                off += 8
             }
-            result.append(Double(bitPattern: UInt64(littleEndian: bits)))
-            offset += 8
+            return result
         }
-        return result
     }
 
     static func decodeBooleans(_ data: Data, count: Int) -> [Bool] {
-        var result = [Bool]()
-        result.reserveCapacity(count)
-        for i in 0..<count {
-            let byteIdx = i / 8
-            let bitIdx = i % 8
-            guard data.startIndex + byteIdx < data.endIndex else { break }
-            let bit = (data[data.startIndex + byteIdx] >> bitIdx) & 1
-            result.append(bit != 0)
+        data.withUnsafeBytes { buf in
+            var result = [Bool]()
+            result.reserveCapacity(count)
+            for i in 0..<count {
+                let byteIdx = i >> 3
+                let bitIdx = i & 7
+                guard byteIdx < buf.count else { break }
+                result.append((buf[byteIdx] >> bitIdx) & 1 != 0)
+            }
+            return result
         }
-        return result
     }
 
     static func decodeByteArrays(_ data: Data, count: Int) -> [ByteArray] {
         var result = [ByteArray]()
         result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 4 <= data.endIndex else { break }
-            var len: UInt32 = 0
-            withUnsafeMutableBytes(of: &len) { ptr in
-                for i in 0..<4 { ptr[i] = data[offset + i] }
+        let si = data.startIndex
+        data.withUnsafeBytes { buf in
+            var off = 0
+            for _ in 0..<count {
+                guard off + 4 <= buf.count else { return }
+                let len = Int(UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt32.self)))
+                off += 4
+                guard off + len <= buf.count else { return }
+                result.append(ByteArray(Data(data[(si + off)..<(si + off + len)])))
+                off += len
             }
-            len = UInt32(littleEndian: len)
-            offset += 4
-            guard offset + Int(len) <= data.endIndex else { break }
-            result.append(ByteArray(Data(data[offset..<(offset + Int(len))])))
-            offset += Int(len)
         }
         return result
     }
@@ -227,29 +219,31 @@ struct PlainDecoder {
     static func decodeFixedLenByteArrays(_ data: Data, count: Int, typeLength: Int) -> [FixedLenByteArray] {
         var result = [FixedLenByteArray]()
         result.reserveCapacity(count)
-        var offset = data.startIndex
+        let si = data.startIndex
+        var off = 0
         for _ in 0..<count {
-            guard offset + typeLength <= data.endIndex else { break }
-            result.append(FixedLenByteArray(Data(data[offset..<(offset + typeLength)])))
-            offset += typeLength
+            guard off + typeLength <= data.count else { break }
+            result.append(FixedLenByteArray(Data(data[(si + off)..<(si + off + typeLength)])))
+            off += typeLength
         }
         return result
     }
 
     static func decodeInt96s(_ data: Data, count: Int) -> [Int96] {
-        var result = [Int96]()
-        result.reserveCapacity(count)
-        var offset = data.startIndex
-        for _ in 0..<count {
-            guard offset + 12 <= data.endIndex else { break }
-            var w0: UInt32 = 0, w1: UInt32 = 0, w2: UInt32 = 0
-            withUnsafeMutableBytes(of: &w0) { ptr in for i in 0..<4 { ptr[i] = data[offset + i] } }
-            withUnsafeMutableBytes(of: &w1) { ptr in for i in 0..<4 { ptr[i] = data[offset + 4 + i] } }
-            withUnsafeMutableBytes(of: &w2) { ptr in for i in 0..<4 { ptr[i] = data[offset + 8 + i] } }
-            result.append(Int96((UInt32(littleEndian: w0), UInt32(littleEndian: w1), UInt32(littleEndian: w2))))
-            offset += 12
+        data.withUnsafeBytes { buf in
+            var result = [Int96]()
+            result.reserveCapacity(count)
+            var off = 0
+            for _ in 0..<count {
+                guard off + 12 <= buf.count else { break }
+                let w0 = UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off, as: UInt32.self))
+                let w1 = UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off + 4, as: UInt32.self))
+                let w2 = UInt32(littleEndian: buf.loadUnaligned(fromByteOffset: off + 8, as: UInt32.self))
+                result.append(Int96((w0, w1, w2)))
+                off += 12
+            }
+            return result
         }
-        return result
     }
 }
 

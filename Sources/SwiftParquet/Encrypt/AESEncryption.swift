@@ -93,7 +93,6 @@ struct ParquetAESGCM {
             throw ParquetError.corruptedFile("encrypted module too short (\(ciphertext.count) bytes)")
         }
 
-
         let base = ciphertext.startIndex
         let nonceLen = UInt32(ciphertext[base]) |
                        (UInt32(ciphertext[base + 1]) << 8) |
@@ -102,7 +101,7 @@ struct ParquetAESGCM {
 
         let nonceEnd = 4 + Int(nonceLen)
         guard nonceEnd + 16 <= ciphertext.count else {
-            throw ParquetError.corruptedFile("encrypted module truncated (count=\(ciphertext.count), nonceLen=\(nonceLen), need=\(nonceEnd + 16))")
+            throw ParquetError.corruptedFile("encrypted module truncated")
         }
 
         let nonceData = ciphertext[(base + 4)..<(base + nonceEnd)]

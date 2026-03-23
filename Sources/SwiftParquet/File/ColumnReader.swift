@@ -36,15 +36,23 @@ struct ColumnChunkReader {
             offset = Int(columnMeta.dataPageOffset)
         }
 
-        // Read data pages
+        // Read data pages — pre-allocate based on expected size
+        let totalExpected = columnMeta.numValues
         var allValueData = Data()
+        let estimatedSize: Int
+        switch columnMeta.type {
+        case .int32, .float: estimatedSize = Int(totalExpected) * 4
+        case .int64, .double: estimatedSize = Int(totalExpected) * 8
+        case .int96: estimatedSize = Int(totalExpected) * 12
+        case .boolean: estimatedSize = (Int(totalExpected) + 7) / 8
+        case .byteArray, .fixedLenByteArray: estimatedSize = 0
+        }
+        if estimatedSize > 0 { allValueData.reserveCapacity(estimatedSize) }
         var totalValues: Int32 = 0
         var encoding: Encoding = .plain
         var allDefLevels: [Int32]? = maxDefLevel > 0 ? [] : nil
         var allRepLevels: [Int32]? = maxRepLevel > 0 ? [] : nil
         var dataPageCount = 0
-
-        let totalExpected = columnMeta.numValues
         while totalValues < totalExpected {
             guard offset < fileData.count else { break }
 
@@ -84,10 +92,13 @@ struct ColumnChunkReader {
             offset += headerSize + Int(header.compressedPageSize)
         }
 
-        // Determine how many non-null values we have
+        // Determine how many non-null values we have (counting loop, no allocation)
         let numNonNull: Int
         if let defLevels = allDefLevels {
-            numNonNull = defLevels.filter { $0 == Int32(maxDefLevel) }.count
+            let target = Int32(maxDefLevel)
+            var count = 0
+            for level in defLevels { if level == target { count += 1 } }
+            numNonNull = count
         } else {
             numNonNull = Int(totalValues)
         }
@@ -111,7 +122,7 @@ struct ColumnChunkReader {
         switch columnMeta.type {
         case .byteArray:
             let values = try decoder.decodeByteArrays(indexData: indexData, numValues: numValues)
-            return .strings(values.map { String(data: $0.data, encoding: .utf8) ?? "" })
+            return .strings(values.map { String(decoding: $0.data, as: UTF8.self) })
         case .int32:
             return .int32s(try decoder.decodeInt32s(indexData: indexData, numValues: numValues))
         case .int64:
@@ -139,7 +150,7 @@ struct ColumnChunkReader {
             return .doubles(PlainDecoder.decodeDoubles(valueData, count: numValues))
         case .byteArray:
             let values = PlainDecoder.decodeByteArrays(valueData, count: numValues)
-            return .strings(values.map { String(data: $0.data, encoding: .utf8) ?? "" })
+            return .strings(values.map { String(decoding: $0.data, as: UTF8.self) })
         case .fixedLenByteArray:
             let values = PlainDecoder.decodeByteArrays(valueData, count: numValues)
             return .byteArrays(values)

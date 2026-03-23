@@ -241,11 +241,11 @@ struct ThriftCompactReader {
     }
 
     mutating func readDouble() throws -> Double {
-        let bytes = try readBytes(8)
-        var bits: UInt64 = 0
-        withUnsafeMutableBytes(of: &bits) { ptr in
-            bytes.copyBytes(to: ptr.bindMemory(to: UInt8.self))
+        guard offset + 8 <= data.count else { throw ParquetError.unexpectedEOF }
+        let bits = data.withUnsafeBytes { buf in
+            buf.loadUnaligned(fromByteOffset: offset, as: UInt64.self)
         }
+        offset += 8
         return Double(bitPattern: UInt64(littleEndian: bits))
     }
 
@@ -257,10 +257,7 @@ struct ThriftCompactReader {
 
     mutating func readString() throws -> String {
         let bytes = try readBinary()
-        guard let s = String(data: bytes, encoding: .utf8) else {
-            throw ParquetError.thriftError("invalid UTF-8 string")
-        }
-        return s
+        return String(decoding: bytes, as: UTF8.self)
     }
 
     mutating func readFieldHeader(previousFieldID: Int32) throws -> (fieldID: Int32, typeID: UInt8)? {
