@@ -1,70 +1,155 @@
 # SwiftParquet
 
-Pure Swift implementation of the [Apache Parquet](https://parquet.apache.org/) file format. Port of [github.com/apache/arrow-go/parquet](https://github.com/apache/arrow-go/tree/main/parquet).
-
-**Status:** Phase 1 complete — write flat-column Parquet files readable by pyarrow, DuckDB, and any standard Parquet reader.
+A pure Swift implementation of the [Apache Parquet](https://parquet.apache.org/) file format for macOS, iOS, and Linux.
 
 ## Features
 
-- **Zero dependencies.** Pure Swift. No C, no bridging headers, no system libraries.
-- **macOS 13+, iOS 16+** (Linux coming in Phase 2).
-- **Write flat Parquet files** with any mix of physical types.
-- **Plain encoding, no compression** (Phase 1). Dictionary encoding + Snappy/Gzip in Phase 2.
-- **pyarrow and DuckDB compatible** — validated on every test run.
+| Category | Details |
+|---|---|
+| **Compression** | Snappy, Gzip, Zstd (all pure Swift on macOS/iOS; system zlib on Linux) |
+| **Encodings** | Plain, Dictionary (RLE), Delta Binary Packed, Delta Byte Array |
+| **Nested types** | List, Map, Struct via the Dremel algorithm |
+| **Page formats** | Data page V1 and V2 |
+| **Encryption** | AES-GCM-128/192/256 column and footer encryption |
+| **Bloom filters** | Split-block with xxHash64 |
+| **Statistics** | Per-column min/max/null_count |
+| **Streaming** | Write large files with constant memory via `ParquetStreamWriter` |
+| **Async** | Parallel column reading with Swift concurrency |
+| **Platforms** | macOS 13+, iOS 16+, Linux (Swift 6.x) |
+| **Dependencies** | None on Apple platforms. [swift-crypto](https://github.com/apple/swift-crypto) on Linux only. |
 
-## Quick Start
+Validated against **pyarrow** and **DuckDB** on every test run (29 tests).
+
+## Installation
+
+```swift
+// Package.swift
+dependencies: [
+    .package(url: "https://github.com/mrowlinson/SwiftParquet", from: "0.4.0"),
+]
+```
+
+On Linux, install zlib: `apt install zlib1g-dev`
+
+## Usage
+
+### Write flat columns
 
 ```swift
 import SwiftParquet
 
-// 1. Define schema
 var schema = SchemaBuilder()
-schema.addColumn(name: "title",    type: .byteArray)
-schema.addColumn(name: "views",    type: .int64)
-schema.addColumn(name: "score",    type: .double)
+schema.addColumn(name: "city",  type: .byteArray)
+schema.addColumn(name: "pop",   type: .int64)
+schema.addColumn(name: "score", type: .double)
 
-// 2. Write
-var writer = ParquetFileWriter(path: "output.parquet", schema: schema.build())
+var writer = ParquetFileWriter(path: "cities.parquet", schema: schema.build(), options: .snappy)
 try writer.writeRowGroup(columns: [
-    ("title",  .strings(["Article 1", "Article 2", "Article 3"])),
-    ("views",  .int64s([1200, 450, 8900])),
-    ("score",  .doubles([4.5, 3.1, 4.9])),
+    ("city",  .strings(["Tokyo", "Delhi", "Shanghai"])),
+    ("pop",   .int64s([37_400_068, 32_941_000, 29_210_808])),
+    ("score", .doubles([9.1, 8.4, 8.8])),
 ])
 try writer.close()
 ```
 
-Validate with pyarrow:
-```sh
-python3 -c "import pyarrow.parquet as pq; print(pq.read_table('output.parquet').to_pandas())"
-```
-```
-      title  views  score
-0  Article 1   1200    4.5
-1  Article 2    450    3.1
-2  Article 3   8900    4.9
-```
-
-Or DuckDB:
-```sh
-duckdb -c "SELECT * FROM 'output.parquet'"
-```
-
-## Installation
-
-Add to `Package.swift`:
+### Read
 
 ```swift
-dependencies: [
-    .package(url: "https://github.com/mrowlinson/SwiftParquet", from: "0.1.0"),
-],
-targets: [
-    .target(name: "MyTarget", dependencies: ["SwiftParquet"]),
-]
+let table = try ParquetFileReader.read(path: "cities.parquet")
+print(table.columnNames)  // ["city", "pop", "score"]
+print(table.numRows)      // 3
+
+if case .int64s(let pops) = table.column("pop") {
+    print(pops)  // [37400068, 32941000, 29210808]
+}
 ```
 
-## Supported Types
+### Async parallel read
 
-| Swift type | Parquet physical type | SchemaBuilder argument |
+```swift
+let table = try await ParquetFileReader.readAsync(path: "cities.parquet")
+```
+
+### Nested types (List, Map, Struct)
+
+```swift
+var schema = SchemaBuilder()
+schema.addColumn(name: "name", type: .byteArray)
+schema.addList(name: "tags", elementType: .byteArray)
+schema.addMap(name: "scores", keyType: .byteArray, valueType: .int32)
+
+var writer = ParquetFileWriter(path: "nested.parquet", schema: schema.build())
+try writer.writeRows([
+    .struct([
+        ("name", .string("Alice")),
+        ("tags", .list([.string("swift"), .string("parquet")])),
+        ("scores", .map([
+            (key: .string("math"), value: .int32(95)),
+            (key: .string("eng"),  value: .int32(88)),
+        ])),
+    ]),
+    .struct([
+        ("name", .string("Bob")),
+        ("tags", .list([.string("data")])),
+        ("scores", .map([
+            (key: .string("math"), value: .int32(72)),
+        ])),
+    ]),
+])
+try writer.close()
+```
+
+### Streaming writer (constant memory)
+
+```swift
+var schema = SchemaBuilder()
+schema.addColumn(name: "id", type: .int64)
+schema.addColumn(name: "value", type: .double)
+
+var writer = try ParquetStreamWriter(path: "large.parquet", schema: schema.build(), options: .zstd)
+for batch in batches {
+    try writer.writeBatch(columns: [
+        ("id",    .int64s(batch.ids)),
+        ("value", .doubles(batch.values)),
+    ])
+}
+try writer.close()
+```
+
+### Encryption
+
+```swift
+import CryptoKit  // or Crypto on Linux
+
+let key = SymmetricKey(size: .bits128)
+var writer = ParquetFileWriter(
+    path: "encrypted.parquet",
+    schema: schema.build(),
+    encryption: .uniformEncryption(key: key)
+)
+// ... write and close as normal
+```
+
+### Write options
+
+```swift
+ParquetWriteOptions()           // no compression
+ParquetWriteOptions.snappy      // snappy + dictionary
+ParquetWriteOptions.gzip        // gzip + dictionary
+ParquetWriteOptions.zstd        // zstd + dictionary
+
+// Custom
+ParquetWriteOptions(
+    compression: .snappy,
+    useDictionary: true,
+    enableStatistics: true,
+    dataPageVersion: .v2
+)
+```
+
+## Type mapping
+
+| Swift | Parquet | ColumnValues |
 |---|---|---|
 | `String` | `BYTE_ARRAY` (UTF-8) | `.strings([...])` |
 | `Int32` | `INT32` | `.int32s([...])` |
@@ -72,68 +157,64 @@ targets: [
 | `Float` | `FLOAT` | `.floats([...])` |
 | `Double` | `DOUBLE` | `.doubles([...])` |
 | `Bool` | `BOOLEAN` | `.booleans([...])` |
-| `ByteArray` | `BYTE_ARRAY` | `.byteArrays([...])` |
+| `Data` | `BYTE_ARRAY` | `.byteArrays([...])` |
+
+For nested data, use `ParquetRecord`:
+
+| ParquetRecord case | Parquet logical type |
+|---|---|
+| `.list([...])` | `LIST` |
+| `.map([(key:, value:)])` | `MAP` |
+| `.struct([(String, ...)])` | Group |
+| `.null` | null at any level |
 
 ## Architecture
 
 ```
 Sources/SwiftParquet/
-├── Types.swift              # PhysicalType, Encoding, Repetition, ParquetError, Int96
-├── Thrift/
-│   └── ThriftCompact.swift  # Hand-rolled TCompactProtocol (not generated)
-├── Format/
-│   └── Generated.swift      # FileMetaData, SchemaElement, PageHeader, etc.
+├── Types.swift                    # Core types, ParquetRecord enum
+├── Thrift/ThriftCompact.swift     # TCompactProtocol reader + writer
+├── Format/Generated.swift         # All Parquet metadata structs
 ├── Schema/
-│   ├── SchemaNode.swift     # GroupNode, PrimitiveNode, ParquetSchema
-│   └── Column.swift         # ColumnDescriptor
+│   ├── SchemaNode.swift           # GroupNode, PrimitiveNode, ParquetSchema
+│   ├── Column.swift               # ColumnDescriptor
+│   └── Dremel.swift               # Shredder + assembler for nested types
 ├── Encoding/
-│   ├── PlainEncoding.swift  # ParquetValue protocol + all physical types
-│   └── RLE.swift            # RLE/bit-packing hybrid (for def/rep levels)
+│   ├── PlainEncoding.swift        # ParquetValue protocol + Plain codec
+│   ├── RLE.swift                  # RLE/bit-packing hybrid
+│   ├── DictionaryEncoding.swift   # Dictionary encoder/decoder
+│   ├── DeltaEncoding.swift        # Delta Binary Packed, Delta Byte Array
+│   └── BloomFilter.swift          # Split-block Bloom filter + xxHash64
+├── Compress/
+│   ├── Compression.swift          # Codec protocol + registry
+│   ├── Snappy.swift               # Pure Swift
+│   ├── Gzip.swift                 # Compression framework (Apple) / zlib (Linux)
+│   ├── Zstd.swift                 # Pure Swift
+│   └── CRC32.swift                # For gzip trailer
 ├── File/
-│   ├── PageWriter.swift     # Data page V1 serialization
-│   ├── ColumnWriter.swift   # Per-column value accumulation and flushing
-│   ├── RowGroupWriter.swift # Row group assembly
-│   └── FileWriter.swift     # PAR1 magic + footer + FileMetaData
-└── Convenience/
-    └── SimpleWriter.swift   # ParquetFileWriter, SchemaBuilder, ColumnValues
+│   ├── PageWriter.swift           # V1 + V2 page serialization
+│   ├── PageReader.swift           # V1 + V2 page deserialization
+│   ├── ColumnWriter.swift         # Per-column write with levels/compression/dict
+│   ├── ColumnReader.swift         # Per-column read with all encodings
+│   ├── RowGroupWriter.swift       # Row group assembly
+│   ├── FileWriter.swift           # PAR1 framing + footer
+│   ├── FileReader.swift           # File parsing + async parallel read
+│   └── StreamingFileWriter.swift  # FileHandle-based streaming output
+├── Convenience/
+│   ├── SimpleWriter.swift         # ParquetFileWriter, SchemaBuilder
+│   ├── SimpleReader.swift         # ParquetFileReader, ParquetTable
+│   └── StreamingWriter.swift      # ParquetStreamWriter
+└── Encrypt/
+    └── AESEncryption.swift        # AES-GCM via CryptoKit / swift-crypto
 ```
 
-### Key design decisions
-
-- **Thrift is hand-rolled.** The Go source uses generated Thrift code via the Apache Thrift library. SwiftParquet implements `TCompactProtocol` directly (~300 lines) using a `ThriftCompactWriter` struct with a field-ID stack for nested struct tracking.
-- **Generics replace code generation.** The Go library uses `go:generate` to produce typed column readers/writers. SwiftParquet uses `ColumnWriter<T: ParquetValue>` generics instead.
-- **ARC replaces manual reference counting.** Go's `memory.Buffer` with `Retain()`/`Release()` is replaced with `Data` and `[UInt8]` managed by ARC.
-
-## Development
+## Developing
 
 ```sh
 swift build
-swift test
+swift test   # 29 tests — roundtrips, compression, nested types, pyarrow interop
 ```
-
-Reference source is at `/tmp/arrow-go/` (clone with `git clone --depth 1 https://github.com/apache/arrow-go.git /tmp/arrow-go`).
-
-## Roadmap
-
-### Phase 1 (complete)
-- [x] Flat-column Parquet writer (Plain encoding, no compression)
-- [x] All primitive physical types
-- [x] pyarrow + DuckDB interop validation
-
-### Phase 2 (next)
-- [ ] File reader + column reader
-- [ ] Snappy and Gzip compression
-- [ ] Dictionary encoding (major compression win for string columns)
-- [ ] Column statistics (min/max/null\_count)
-- [ ] Roundtrip tests (write→read, pyarrow→SwiftParquet, SwiftParquet→pyarrow)
-
-### Phase 3 (requires user confirmation before starting)
-- [ ] Nested types: List, Map, Struct (Dremel algorithm)
-- [ ] AES-GCM encryption
-- [ ] Split block Bloom filters
-- [ ] Zstd compression
-- [ ] Delta encodings (DeltaBinaryPacked, DeltaByteArray)
 
 ## License
 
-Apache License 2.0 — matching the upstream Apache Arrow Go implementation.
+Apache License 2.0

@@ -94,6 +94,7 @@ public final class PrimitiveNode: SchemaNode, @unchecked Sendable {
 public final class GroupNode: SchemaNode, @unchecked Sendable {
     public let name: String
     public let repetition: Repetition
+    public let convertedType: ConvertedType?
     public private(set) var children: [any SchemaNode]
     public private(set) weak var parent: GroupNode?
 
@@ -119,9 +120,10 @@ public final class GroupNode: SchemaNode, @unchecked Sendable {
         return level
     }
 
-    public init(name: String, repetition: Repetition = .required, children: [any SchemaNode] = []) {
+    public init(name: String, repetition: Repetition = .required, children: [any SchemaNode] = [], convertedType: ConvertedType? = nil) {
         self.name = name
         self.repetition = repetition
+        self.convertedType = convertedType
         self.children = []
         self.addChildren(children)
     }
@@ -156,7 +158,7 @@ public final class GroupNode: SchemaNode, @unchecked Sendable {
             repetitionType: parent == nil ? nil : repetition,  // root has no repetition
             name: name,
             numChildren: Int32(children.count),
-            convertedType: nil,
+            convertedType: convertedType,
             logicalType: nil
         )
         elements.append(groupElement)

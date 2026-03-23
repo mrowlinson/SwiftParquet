@@ -87,6 +87,51 @@ public enum PageType: Int32, Sendable {
     case dataPageV2     = 3
 }
 
+// MARK: - ParquetRecord (nested value type)
+
+/// Recursive value type for nested Parquet data (List, Map, Struct).
+public indirect enum ParquetRecord: Sendable, Equatable {
+    case null
+    case bool(Bool)
+    case int32(Int32)
+    case int64(Int64)
+    case float(Float)
+    case double(Double)
+    case string(String)
+    case bytes(Data)
+    case list([ParquetRecord])
+    case map([(key: ParquetRecord, value: ParquetRecord)])
+    case `struct`([(String, ParquetRecord)])
+
+    public static func == (lhs: ParquetRecord, rhs: ParquetRecord) -> Bool {
+        switch (lhs, rhs) {
+        case (.null, .null): return true
+        case (.bool(let a), .bool(let b)): return a == b
+        case (.int32(let a), .int32(let b)): return a == b
+        case (.int64(let a), .int64(let b)): return a == b
+        case (.float(let a), .float(let b)): return a == b
+        case (.double(let a), .double(let b)): return a == b
+        case (.string(let a), .string(let b)): return a == b
+        case (.bytes(let a), .bytes(let b)): return a == b
+        case (.list(let a), .list(let b)): return a == b
+        case (.map(let a), .map(let b)):
+            guard a.count == b.count else { return false }
+            return zip(a, b).allSatisfy { $0.key == $1.key && $0.value == $1.value }
+        case (.struct(let a), .struct(let b)):
+            guard a.count == b.count else { return false }
+            return zip(a, b).allSatisfy { $0.0 == $1.0 && $0.1 == $1.1 }
+        default: return false
+        }
+    }
+}
+
+// MARK: - Data Page Version
+
+public enum DataPageVersion: Sendable {
+    case v1
+    case v2
+}
+
 // MARK: - Int96
 
 /// 12-byte integer used for representing timestamps (deprecated in modern Parquet).

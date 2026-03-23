@@ -7,10 +7,22 @@ let package = Package(
     products: [
         .library(name: "SwiftParquet", targets: ["SwiftParquet"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-crypto.git", from: "3.0.0"),
+    ],
     targets: [
         .target(
             name: "SwiftParquet",
+            dependencies: [
+                .product(name: "Crypto", package: "swift-crypto",
+                         condition: .when(platforms: [.linux])),
+            ],
             path: "Sources/SwiftParquet"
+        ),
+        .systemLibrary(
+            name: "CZlib",
+            pkgConfig: "zlib",
+            providers: [.apt(["zlib1g-dev"]), .brew(["zlib"])]
         ),
         .testTarget(
             name: "SwiftParquetTests",

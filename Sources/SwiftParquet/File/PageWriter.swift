@@ -90,4 +90,77 @@ struct PageWriter {
             compressedSize: pageSize
         )
     }
+
+    /// Encode a data page V2.
+    /// V2: levels are uncompressed, only values are compressed.
+    static func encodeDataPageV2(
+        valueBytes: Data,
+        numValues: Int32,
+        numNulls: Int32 = 0,
+        numRows: Int32,
+        defLevels: [Int32]?,
+        repLevels: [Int32]?,
+        maxDefLevel: Int16,
+        maxRepLevel: Int16,
+        encoding: Encoding = .plain,
+        codec: CompressionCodec = .uncompressed
+    ) throws -> EncodedDataPage {
+
+        // Encode levels (no 4-byte length prefix for V2)
+        var repLevelBytes = Data()
+        if maxRepLevel > 0, let rep = repLevels {
+            let bw = bitWidthForMaxLevel(maxRepLevel)
+            let encoder = RLEEncoder(bitWidth: bw)
+            repLevelBytes = encoder.encode(rep)
+        }
+
+        var defLevelBytes = Data()
+        if maxDefLevel > 0, let def = defLevels {
+            let bw = bitWidthForMaxLevel(maxDefLevel)
+            let encoder = RLEEncoder(bitWidth: bw)
+            defLevelBytes = encoder.encode(def)
+        }
+
+        // Compress only values
+        var compressedValues = valueBytes
+        if codec != .uncompressed {
+            let compressor = try CompressionCodecs.codec(for: codec)
+            compressedValues = try compressor.compress(valueBytes)
+        }
+
+        let uncompressedPageSize = Int32(repLevelBytes.count + defLevelBytes.count + valueBytes.count)
+        let compressedPageSize = Int32(repLevelBytes.count + defLevelBytes.count + compressedValues.count)
+
+        let header = PageHeader(
+            type: .dataPageV2,
+            uncompressedPageSize: uncompressedPageSize,
+            compressedPageSize: compressedPageSize,
+            dataPageHeader: nil,
+            dictionaryPageHeader: nil,
+            dataPageHeaderV2: DataPageHeaderV2(
+                numValues: numValues,
+                numNulls: numNulls,
+                numRows: numRows,
+                encoding: encoding,
+                definitionLevelsByteLength: Int32(defLevelBytes.count),
+                repetitionLevelsByteLength: Int32(repLevelBytes.count),
+                isCompressed: codec != .uncompressed,
+                statistics: nil
+            )
+        )
+        let headerBytes = ThriftCompactWriter.serialize(header)
+
+        var result = Data(capacity: headerBytes.count + Int(compressedPageSize))
+        result.append(contentsOf: headerBytes)
+        result.append(contentsOf: repLevelBytes)
+        result.append(contentsOf: defLevelBytes)
+        result.append(contentsOf: compressedValues)
+
+        return EncodedDataPage(
+            bytes: result,
+            numValues: numValues,
+            uncompressedSize: uncompressedPageSize,
+            compressedSize: compressedPageSize
+        )
+    }
 }

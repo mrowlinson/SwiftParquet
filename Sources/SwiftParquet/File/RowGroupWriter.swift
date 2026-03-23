@@ -24,8 +24,6 @@ struct RowGroupWriter {
         self.columnWriters = columnWriters
     }
 
-    /// Close all columns and assemble the row group bytes + metadata.
-    /// - Parameter fileOffset: Byte offset in the file where this row group starts.
     mutating func close(fileOffset: Int64) -> RowGroupWriteResult {
         var groupBytes = Data()
         var columnChunks: [ColumnChunk] = []
@@ -36,7 +34,7 @@ struct RowGroupWriter {
             let result = columnWriters[i].closeColumn(startOffset: colStartOffset)
 
             for page in result.pages {
-                groupBytes.append(contentsOf: page.bytes)
+                groupBytes.append(contentsOf: page)
             }
 
             let chunk = ColumnChunk(

@@ -123,6 +123,136 @@ public struct FixedLenByteArray: ParquetValue, Sendable {
     }
 }
 
+// MARK: - Plain Decoder
+
+/// Decodes plain-encoded values from a Data buffer.
+struct PlainDecoder {
+
+    static func decodeInt32s(_ data: Data, count: Int) -> [Int32] {
+        var result = [Int32]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 4 <= data.endIndex else { break }
+            var v: Int32 = 0
+            withUnsafeMutableBytes(of: &v) { ptr in
+                for i in 0..<4 { ptr[i] = data[offset + i] }
+            }
+            result.append(Int32(littleEndian: v))
+            offset += 4
+        }
+        return result
+    }
+
+    static func decodeInt64s(_ data: Data, count: Int) -> [Int64] {
+        var result = [Int64]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 8 <= data.endIndex else { break }
+            var v: Int64 = 0
+            withUnsafeMutableBytes(of: &v) { ptr in
+                for i in 0..<8 { ptr[i] = data[offset + i] }
+            }
+            result.append(Int64(littleEndian: v))
+            offset += 8
+        }
+        return result
+    }
+
+    static func decodeFloats(_ data: Data, count: Int) -> [Float] {
+        var result = [Float]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 4 <= data.endIndex else { break }
+            var bits: UInt32 = 0
+            withUnsafeMutableBytes(of: &bits) { ptr in
+                for i in 0..<4 { ptr[i] = data[offset + i] }
+            }
+            result.append(Float(bitPattern: UInt32(littleEndian: bits)))
+            offset += 4
+        }
+        return result
+    }
+
+    static func decodeDoubles(_ data: Data, count: Int) -> [Double] {
+        var result = [Double]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 8 <= data.endIndex else { break }
+            var bits: UInt64 = 0
+            withUnsafeMutableBytes(of: &bits) { ptr in
+                for i in 0..<8 { ptr[i] = data[offset + i] }
+            }
+            result.append(Double(bitPattern: UInt64(littleEndian: bits)))
+            offset += 8
+        }
+        return result
+    }
+
+    static func decodeBooleans(_ data: Data, count: Int) -> [Bool] {
+        var result = [Bool]()
+        result.reserveCapacity(count)
+        for i in 0..<count {
+            let byteIdx = i / 8
+            let bitIdx = i % 8
+            guard data.startIndex + byteIdx < data.endIndex else { break }
+            let bit = (data[data.startIndex + byteIdx] >> bitIdx) & 1
+            result.append(bit != 0)
+        }
+        return result
+    }
+
+    static func decodeByteArrays(_ data: Data, count: Int) -> [ByteArray] {
+        var result = [ByteArray]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 4 <= data.endIndex else { break }
+            var len: UInt32 = 0
+            withUnsafeMutableBytes(of: &len) { ptr in
+                for i in 0..<4 { ptr[i] = data[offset + i] }
+            }
+            len = UInt32(littleEndian: len)
+            offset += 4
+            guard offset + Int(len) <= data.endIndex else { break }
+            result.append(ByteArray(Data(data[offset..<(offset + Int(len))])))
+            offset += Int(len)
+        }
+        return result
+    }
+
+    static func decodeFixedLenByteArrays(_ data: Data, count: Int, typeLength: Int) -> [FixedLenByteArray] {
+        var result = [FixedLenByteArray]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + typeLength <= data.endIndex else { break }
+            result.append(FixedLenByteArray(Data(data[offset..<(offset + typeLength)])))
+            offset += typeLength
+        }
+        return result
+    }
+
+    static func decodeInt96s(_ data: Data, count: Int) -> [Int96] {
+        var result = [Int96]()
+        result.reserveCapacity(count)
+        var offset = data.startIndex
+        for _ in 0..<count {
+            guard offset + 12 <= data.endIndex else { break }
+            var w0: UInt32 = 0, w1: UInt32 = 0, w2: UInt32 = 0
+            withUnsafeMutableBytes(of: &w0) { ptr in for i in 0..<4 { ptr[i] = data[offset + i] } }
+            withUnsafeMutableBytes(of: &w1) { ptr in for i in 0..<4 { ptr[i] = data[offset + 4 + i] } }
+            withUnsafeMutableBytes(of: &w2) { ptr in for i in 0..<4 { ptr[i] = data[offset + 8 + i] } }
+            result.append(Int96((UInt32(littleEndian: w0), UInt32(littleEndian: w1), UInt32(littleEndian: w2))))
+            offset += 12
+        }
+        return result
+    }
+}
+
 // MARK: - Plain Encoder (generic)
 
 /// Encodes a sequence of ParquetValues using plain encoding.

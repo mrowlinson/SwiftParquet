@@ -147,6 +147,107 @@ struct RLEEncoder {
     }
 }
 
+// MARK: - RLE Decoder
+
+/// Decodes RLE/bit-packing hybrid encoded data.
+struct RLEDecoder {
+    private let bitWidth: Int
+
+    init(bitWidth: Int) {
+        self.bitWidth = bitWidth
+    }
+
+    /// Decode values from RLE-encoded bytes (WITHOUT length prefix).
+    func decode(_ data: Data, expectedCount: Int) -> [Int32] {
+        guard bitWidth > 0 && !data.isEmpty else {
+            return [Int32](repeating: 0, count: expectedCount)
+        }
+
+        var result = [Int32]()
+        result.reserveCapacity(expectedCount)
+        var offset = 0
+
+        while offset < data.count && result.count < expectedCount {
+            // Read varint header
+            var header: UInt64 = 0
+            var shift: UInt64 = 0
+            while offset < data.count {
+                let b = data[data.startIndex + offset]
+                offset += 1
+                header |= UInt64(b & 0x7F) << shift
+                if b & 0x80 == 0 { break }
+                shift += 7
+            }
+
+            if header & 1 == 1 {
+                // Literal run: (numGroups << 1) | 1
+                let numGroups = Int(header >> 1)
+                let numValues = numGroups * 8
+                let totalBits = numValues * bitWidth
+                let byteCount = (totalBits + 7) / 8
+
+                guard offset + byteCount <= data.count else { break }
+                let start = data.startIndex + offset
+
+                var bitPos = 0
+                for _ in 0..<numValues {
+                    guard result.count < expectedCount else { break }
+                    var value: UInt32 = 0
+                    for bit in 0..<bitWidth {
+                        let byteIdx = bitPos / 8
+                        let bitIdx = bitPos % 8
+                        if byteIdx < byteCount {
+                            if (data[start + byteIdx] >> bitIdx) & 1 != 0 {
+                                value |= UInt32(1) << bit
+                            }
+                        }
+                        bitPos += 1
+                    }
+                    result.append(Int32(bitPattern: value))
+                }
+                offset += byteCount
+            } else {
+                // RLE run: (count << 1)
+                let count = Int(header >> 1)
+                let valueByteCount = (bitWidth + 7) / 8
+                guard offset + valueByteCount <= data.count else { break }
+
+                var value: UInt64 = 0
+                for i in 0..<valueByteCount {
+                    value |= UInt64(data[data.startIndex + offset + i]) << (i * 8)
+                }
+                offset += valueByteCount
+
+                let val = Int32(bitPattern: UInt32(value & 0xFFFF_FFFF))
+                for _ in 0..<min(count, expectedCount - result.count) {
+                    result.append(val)
+                }
+            }
+        }
+
+        // Pad if we didn't get enough
+        while result.count < expectedCount { result.append(0) }
+
+        return Array(result.prefix(expectedCount))
+    }
+
+    /// Decode from data WITH the 4-byte LE length prefix.
+    func decodeWithLengthPrefix(_ data: Data, at offset: Int, expectedCount: Int) -> (values: [Int32], bytesConsumed: Int) {
+        guard offset + 4 <= data.count else {
+            return ([Int32](repeating: 0, count: expectedCount), 0)
+        }
+        let start = data.startIndex + offset
+        var len: UInt32 = 0
+        withUnsafeMutableBytes(of: &len) { ptr in
+            for i in 0..<4 { ptr[i] = data[start + i] }
+        }
+        len = UInt32(littleEndian: len)
+        let rleData = data[(start + 4)..<(start + 4 + Int(len))]
+        let values = decode(Data(rleData), expectedCount: expectedCount)
+        return (values, 4 + Int(len))
+    }
+}
+
 // MARK: - Convenience: compute bit width for a max level value
 
 /// Returns the number of bits needed to represent values in [0, maxValue].

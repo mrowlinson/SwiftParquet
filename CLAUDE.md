@@ -8,20 +8,27 @@ swift build
 swift test
 
 ## Architecture
-- Sources/SwiftParquet/ — single target, no external dependencies
-- Thrift/ — hand-rolled TCompactProtocol (not generated code)
-- Format/ — Swift structs matching parquet.thrift definitions
-- Encoding/ — column value encoding (Plain, RLE, Dictionary, Delta*)
-- Compress/ — compression codecs (Snappy, Gzip, Zstd)
-- File/ — file/row-group/column/page readers and writers
-- Schema/ — Parquet schema tree and column descriptors
+- Sources/SwiftParquet/ — single target, swift-crypto conditional dep (Linux only)
+- Thrift/ — hand-rolled TCompactProtocol writer + reader
+- Format/ — Swift structs matching parquet.thrift definitions (with ThriftReadable/ThriftWritable)
+- Encoding/ — column value encoding/decoding (Plain, RLE, Dictionary, DeltaBinaryPacked, DeltaByteArray, BloomFilter)
+- Compress/ — compression codecs (Snappy pure Swift, Gzip via Compression/CZlib, Zstd pure Swift, CRC32)
+- File/ — file/row-group/column/page readers and writers, StreamingFileWriter
+- Schema/ — Parquet schema tree, column descriptors, Dremel shredder/assembler
+- Convenience/ — ParquetFileWriter, ParquetFileReader, ParquetStreamWriter, SchemaBuilder, ParquetTable
+- Encrypt/ — AES-GCM column/footer encryption via CryptoKit/swift-crypto
+- Sources/CZlib/ — system library module for zlib (Linux)
 
 ## Key Design Decisions
-- Zero dependencies. Pure Swift.
+- Zero external dependencies on macOS. swift-crypto only on Linux (mirrors CryptoKit API).
 - Generics with ParquetValue protocol instead of Go's code generation
+- ParquetRecord recursive enum for nested types (List, Map, Struct)
+- Dremel algorithm for shredding/assembling nested records to/from flat columns
 - Data/[UInt8] with ARC instead of Go's manual memory.Buffer refcounting
-- Swift concurrency for parallel column reading (Phase 2+)
 - Thrift compact protocol implemented by hand (~500 lines), not generated
+- Pure Swift Snappy and Zstd — no C imports
+- CryptoKit/swift-crypto for AES-GCM — no OpenSSL
+- Swift concurrency (async/await) for parallel column reading
 
 ## Reference Source
 Primary: github.com/apache/arrow-go/parquet (Apache 2.0)
@@ -32,18 +39,9 @@ Test files: github.com/apache/parquet-testing
 All output must be readable by:
 - pyarrow: python3 -c "import pyarrow.parquet as pq; print(pq.read_table('test.parquet'))"
 - DuckDB: duckdb -c "SELECT * FROM 'test.parquet'"
-- parquet-cli: parquet-tools cat test.parquet
 
-## Phase 1 Scope (MVP)
-Write flat-column Parquet files with Plain encoding, no compression.
-Read not required yet. Dictionary encoding not required yet.
-Must pass pyarrow and DuckDB validation.
-
-## Phase 2 Scope
-Add file reader, column reader, Snappy + Gzip compression, dictionary encoding,
-column statistics. Must pass roundtrip tests (write→read) and cross-tool interop
-(write with SwiftParquet → read with pyarrow, and vice versa).
-
-## ⛔ STOP AFTER PHASE 2
-Do NOT proceed to Phase 3. Report status and wait for user confirmation.
-Phase 3 (nested types, encryption, bloom filters) will use a different model.
+## Completed Phases
+- Phase 1: Flat-column writer (Plain encoding, no compression)
+- Phase 2: File reader, Snappy/Gzip compression, dictionary encoding, statistics, roundtrip tests
+- Phase 3: AES-GCM encryption, Bloom filters, Zstd compression, delta encodings
+- Phase 4: Linux support, Data Page V2, nested types (Dremel), streaming writer, parallel async reader
